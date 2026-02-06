@@ -139,6 +139,7 @@ impl File {
             return new_error(mid, FFErr::Unk, error);
         }
 
+        self.close_fd();
         Ok(())
     }
 
@@ -147,9 +148,6 @@ impl File {
     /// **WARN**: File must be closed beforehand, to avoid I/O errors
     #[inline]
     pub(super) unsafe fn unlink(&self, path: &PathBuf, mid: u8) -> FrozenResult<()> {
-        // sanity check
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
-
         let cpath = path_to_cstring(path, mid)?;
         if unlink(cpath.as_ptr()) != 0 {
             let error = last_os_error();
@@ -682,4 +680,370 @@ fn path_to_cstring(path: &std::path::PathBuf, mid: u8) -> FrozenResult<CString> 
 #[inline]
 fn last_os_error() -> std::io::Error {
     io::Error::last_os_error()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::{tempdir, TempDir};
+
+    // module id (test)
+    const MID: u8 = 0x00;
+
+    fn new_tmp() -> (TempDir, PathBuf, File) {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+        let file = unsafe { File::new(&tmp, true, MID) }.expect("new LinuxFile");
+
+        (dir, tmp, file)
+    }
+
+    mod new_open {
+        use super::*;
+
+        #[test]
+        fn new_works() {
+            let (_dir, tmp, file) = new_tmp();
+            assert!(file.fd() >= 0);
+
+            // sanity check
+            assert!(tmp.exists());
+            assert!(unsafe { file.close(MID).is_ok() });
+        }
+
+        #[test]
+        fn open_works() {
+            let (_dir, tmp, file) = new_tmp();
+            unsafe {
+                assert!(file.fd() >= 0);
+                assert!(file.close(MID).is_ok());
+
+                match File::new(&tmp, false, MID) {
+                    Ok(file) => {
+                        assert!(file.fd() >= 0);
+                        assert!(file.close(MID).is_ok());
+                    }
+                    Err(e) => panic!("failed to open file due to E: {:?}", e),
+                }
+            }
+        }
+
+        #[test]
+        fn open_fails_when_file_is_unlinked() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.fd() >= 0);
+                assert!(file.close(MID).is_ok());
+                assert!(file.unlink(&tmp, MID).is_ok());
+
+                let file = File::new(&tmp, false, MID);
+                assert!(file.is_err());
+            }
+        }
+    }
+
+    mod close {
+        use super::*;
+
+        #[test]
+        fn close_works() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close(MID).is_ok());
+
+                // sanity check
+                assert!(tmp.exists());
+            }
+        }
+
+        #[test]
+        fn close_after_close_does_not_fail() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                // should never fail
+                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).is_ok());
+
+                // sanity check
+                assert!(tmp.exists());
+            }
+
+            // NOTE: We need this protection, cause in multithreaded env's, more then one thread
+            // could try to close the file at same time, hence the system should not panic in these cases
+        }
+    }
+
+    mod sync {
+        use super::*;
+
+        #[test]
+        fn sync_works() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.sync(MID).is_ok());
+                assert!(file.close(MID).is_ok());
+            }
+        }
+    }
+
+    mod unlink {
+        use super::*;
+
+        #[test]
+        fn unlink_correctly_deletes_file() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close(MID).is_ok());
+                assert!(file.unlink(&tmp, MID).is_ok());
+                assert!(!tmp.exists());
+            }
+        }
+
+        #[test]
+        fn unlink_fails_on_unlinked_file() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close(MID).is_ok());
+                assert!(file.unlink(&tmp, MID).is_ok());
+                assert!(!tmp.exists());
+
+                // should fail on missing
+                assert!(file.unlink(&tmp, MID).is_err());
+            }
+        }
+    }
+
+    mod resize {
+        use super::*;
+
+        #[test]
+        fn extend_zero_extends_file() {
+            const NEW_LEN: u64 = 0x80;
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.resize(NEW_LEN, MID).is_ok());
+
+                let curr_len = file.metadata(MID).expect("fetch metadata").st_size;
+                assert_eq!(curr_len, NEW_LEN as i64);
+                assert!(file.close(MID).is_ok());
+            }
+
+            // strict sanity check to ensure file is zero byte extended
+            let file_contents = std::fs::read(&tmp).expect("read from file");
+            assert_eq!(file_contents.len(), NEW_LEN as usize, "len mismatch for file");
+            assert!(
+                file_contents.iter().all(|b| *b == 0u8),
+                "file must be zero byte extended"
+            );
+        }
+
+        #[test]
+        fn open_preserves_existing_length() {
+            const NEW_LEN: u64 = 0x80;
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.resize(NEW_LEN, MID).is_ok());
+
+                let curr_len = file.metadata(MID).expect("fetch metadata").st_size;
+                assert_eq!(curr_len, NEW_LEN as i64);
+
+                assert!(file.sync(MID).is_ok());
+                assert!(file.close(MID).is_ok());
+
+                match File::new(&tmp, false, MID) {
+                    Err(e) => panic!("{:?}", e),
+                    Ok(file) => {
+                        let curr_len = file.metadata(MID).expect("fetch metadata").st_size;
+                        assert_eq!(curr_len, NEW_LEN as i64);
+                    }
+                }
+            }
+        }
+    }
+
+    mod lock_unlock {
+        use super::*;
+
+        #[test]
+        fn lock_unlock_cycle() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.lock(MID).is_ok());
+                assert!(file.unlock(MID).is_ok());
+
+                assert!(file.lock(MID).is_ok());
+                assert!(file.unlock(MID).is_ok());
+
+                assert!(file.close(MID).is_ok());
+            }
+        }
+
+        #[test]
+        fn lock_survives_io_operation() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.lock(MID).is_ok());
+
+                let data = vec![1u8; 0x20];
+                file.resize(data.len() as u64, MID).expect("resize file");
+                file.pwrite(data.as_ptr(), 0, data.len(), MID).expect("write to file");
+
+                assert!(file.unlock(MID).is_ok());
+                assert!(file.close(MID).is_ok());
+            }
+        }
+    }
+
+    mod write_read {
+        use super::*;
+
+        #[test]
+        fn pwrite_pread_cycle() {
+            let (_dir, tmp, file) = new_tmp();
+
+            const LEN: usize = 0x20;
+            const DATA: [u8; LEN] = [0x1A; LEN];
+
+            unsafe {
+                file.resize(LEN as u64, MID).expect("resize file");
+                assert!(file.pwrite(DATA.as_ptr(), 0, LEN, MID).is_ok());
+
+                let mut buf = vec![0u8; LEN];
+                assert!(file.pread(buf.as_mut_ptr(), 0, LEN, MID).is_ok());
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+                assert!(file.close(MID).is_ok());
+            }
+        }
+
+        #[test]
+        fn pwritev_pread_cycle() {
+            let (_dir, tmp, file) = new_tmp();
+
+            const LEN: usize = 0x20;
+            const DATA: [u8; LEN] = [0x1A; LEN];
+
+            let ptrs = vec![DATA.as_ptr(); 0x10];
+            let total_len = ptrs.len() * LEN;
+
+            unsafe {
+                file.resize(total_len as u64, MID).expect("resize file");
+                assert!(file.pwritev(&ptrs, 0, LEN, MID).is_ok());
+
+                let mut buf = vec![0u8; total_len];
+                assert!(file.pread(buf.as_mut_ptr(), 0, total_len, MID).is_ok(), "pread failed");
+                assert_eq!(buf.len(), total_len, "mismatch between read and write");
+
+                for chunk in buf.chunks_exact(LEN) {
+                    assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
+                }
+
+                assert!(file.close(MID).is_ok());
+            }
+        }
+
+        #[test]
+        fn pwrite_pread_cycle_across_sessions() {
+            let (_dir, tmp, file) = new_tmp();
+
+            const LEN: usize = 0x20;
+            const DATA: [u8; LEN] = [0x1A; LEN];
+
+            // create + write + sync + close
+            unsafe {
+                assert!(file.resize(LEN as u64, MID).is_ok());
+                assert!(file.pwrite(DATA.as_ptr(), 0, LEN, MID).is_ok());
+
+                assert!(file.sync(MID).is_ok());
+                assert!(file.close(MID).is_ok());
+            }
+
+            // open + read + verify
+            unsafe {
+                let mut buf = vec![0u8; LEN];
+                let file = File::new(&tmp, false, MID).expect("open file");
+
+                assert!(file.pread(buf.as_mut_ptr(), 0, LEN, MID).is_ok());
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+                assert!(file.close(MID).is_ok());
+            }
+        }
+    }
+
+    mod concurrency {
+        use super::*;
+
+        #[test]
+        fn concurrent_writes_then_read() {
+            const THREADS: usize = 8;
+            const CHUNK: usize = 0x100;
+
+            let (_dir, _tmp, file) = new_tmp();
+            let file = std::sync::Arc::new(file);
+
+            // required len
+            unsafe { file.resize((THREADS * CHUNK) as u64, MID).expect("extend") };
+
+            let mut handles = Vec::new();
+            for i in 0..THREADS {
+                let f = file.clone();
+                handles.push(std::thread::spawn(move || {
+                    let data = vec![i as u8; CHUNK];
+                    unsafe { f.pwrite(data.as_ptr(), i * CHUNK, CHUNK, MID).expect("write") };
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+
+            //
+            // read back (sanity check)
+            //
+
+            let mut read_buf = vec![0u8; THREADS * CHUNK];
+            unsafe { assert!(file.pread(read_buf.as_mut_ptr(), 0, read_buf.len(), MID).is_ok()) };
+
+            for i in 0..THREADS {
+                let chunk = &read_buf[i * CHUNK..(i + 1) * CHUNK];
+                assert!(chunk.iter().all(|b| *b == i as u8));
+            }
+        }
+
+        #[test]
+        fn concurrent_writes_with_lock() {
+            const THREADS: usize = 4;
+            const LEN: usize = 0x80;
+
+            let (_dir, _tmp, file) = new_tmp();
+            let file = std::sync::Arc::new(file);
+
+            unsafe { file.resize(LEN as u64, MID).expect("extend") };
+
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let f = file.clone();
+                handles.push(std::thread::spawn(move || unsafe {
+                    let _guard = f.lock(MID).expect("lock");
+                    let data = vec![0xAB; LEN];
+                    assert!(f.pwrite(data.as_ptr(), 0, LEN, MID).is_ok());
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+        }
+    }
 }

@@ -1,4 +1,4 @@
-use frozen_error::from_err_code;
+use fe::from_err_code;
 use std::env;
 
 fn main() {

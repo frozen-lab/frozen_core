@@ -1,7 +1,7 @@
 use fe::{FrozenError, FrozenResult};
 
-/// Domain Id for [`ff`] is **1**
-const ERRDOMAIN: u8 = 1;
+/// Domain Id for [`ff`] is **17**
+const ERRDOMAIN: u8 = 0x11;
 
 #[inline]
 pub(crate) fn new_error<R>(mid: u8, reason: FFErr, error: std::io::Error) -> FrozenResult<R> {
