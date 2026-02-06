@@ -1,5 +1,5 @@
 use crate::error::{new_error, FFErr};
-use fe::{FrozenError, FrozenResult};
+use fe::{FErr, FRes};
 use libc::{
     c_int, c_short, c_void, close, fcntl, fdatasync, flock, fstat, ftruncate, iovec, off_t, open, pread, preadv,
     pwrite, pwritev, size_t, stat, sysconf, unlink, EACCES, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE,
@@ -25,7 +25,7 @@ unsafe impl Sync for File {}
 
 impl File {
     /// creates/opens a new instance of [`File`]
-    pub(crate) unsafe fn new(path: &PathBuf, is_new: bool, mid: u8) -> FrozenResult<Self> {
+    pub(crate) unsafe fn new(path: &PathBuf, is_new: bool, mid: u8) -> FRes<Self> {
         let fd = open_with_flags(path, prep_flags(is_new), mid)?;
         Ok(Self(AtomicI32::new(fd)))
     }
@@ -59,7 +59,7 @@ impl File {
     /// This way we avoid non-essential metadata updates, such as access time (`atime`),
     /// mod time (`mtime`), and other inode bookkeeping info!
     #[inline]
-    pub(super) unsafe fn sync(&self, mid: u8) -> FrozenResult<()> {
+    pub(super) unsafe fn sync(&self, mid: u8) -> FRes<()> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
 
@@ -115,7 +115,7 @@ impl File {
     ///
     /// This function is _idempotent_ and prevents close-on-close errors!
     #[inline(always)]
-    pub(crate) unsafe fn close(&self, mid: u8) -> FrozenResult<()> {
+    pub(crate) unsafe fn close(&self, mid: u8) -> FRes<()> {
         // prevent multiple close syscalls
         let fd = self.fd();
         if fd == CLOSED_FD {
@@ -147,7 +147,7 @@ impl File {
     ///
     /// **WARN**: File must be closed beforehand, to avoid I/O errors
     #[inline]
-    pub(super) unsafe fn unlink(&self, path: &PathBuf, mid: u8) -> FrozenResult<()> {
+    pub(super) unsafe fn unlink(&self, path: &PathBuf, mid: u8) -> FRes<()> {
         let cpath = path_to_cstring(path, mid)?;
         if unlink(cpath.as_ptr()) != 0 {
             let error = last_os_error();
@@ -159,7 +159,7 @@ impl File {
 
     /// Fetches matadata for [`File`] using `fstat` syscall
     #[inline]
-    pub(crate) unsafe fn metadata(&self, mid: u8) -> FrozenResult<stat> {
+    pub(crate) unsafe fn metadata(&self, mid: u8) -> FRes<stat> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
 
@@ -181,7 +181,7 @@ impl File {
         Ok(st)
     }
 
-    pub(crate) unsafe fn resize(&self, new_len: u64, mid: u8) -> FrozenResult<()> {
+    pub(crate) unsafe fn resize(&self, new_len: u64, mid: u8) -> FRes<()> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
 
@@ -212,13 +212,7 @@ impl File {
 
     /// Read at given `offset` w/ `pread` syscall from [`File`]
     #[inline(always)]
-    pub(super) unsafe fn pread(
-        &self,
-        buf_ptr: *mut u8,
-        offset: usize,
-        len_to_read: usize,
-        mid: u8,
-    ) -> FrozenResult<()> {
+    pub(super) unsafe fn pread(&self, buf_ptr: *mut u8, offset: usize, len_to_read: usize, mid: u8) -> FRes<()> {
         // sanity checks
         debug_assert_ne!(len_to_read, 0, "invalid length");
         debug_assert!(!buf_ptr.is_null(), "invalid buffer pointer");
@@ -272,13 +266,7 @@ impl File {
 
     /// Read (multiple vectors) at given `offset` w/ `preadv` syscall from [`File`]
     #[inline(always)]
-    pub(super) unsafe fn preadv(
-        &self,
-        buf_ptrs: &[*mut u8],
-        offset: usize,
-        buffer_size: usize,
-        mid: u8,
-    ) -> FrozenResult<()> {
+    pub(super) unsafe fn preadv(&self, buf_ptrs: &[*mut u8], offset: usize, buffer_size: usize, mid: u8) -> FRes<()> {
         // sanity checks
         #[cfg(debug_assertions)]
         {
@@ -374,13 +362,7 @@ impl File {
 
     /// Write at given `offset` w/ `pwrite` syscall to [`File`]
     #[inline(always)]
-    pub(super) unsafe fn pwrite(
-        &self,
-        buf_ptr: *const u8,
-        offset: usize,
-        len_to_write: usize,
-        mid: u8,
-    ) -> FrozenResult<()> {
+    pub(super) unsafe fn pwrite(&self, buf_ptr: *const u8, offset: usize, len_to_write: usize, mid: u8) -> FRes<()> {
         // sanity checks
         debug_assert_ne!(len_to_write, 0, "invalid length");
         debug_assert!(!buf_ptr.is_null(), "invalid buffer pointer");
@@ -440,7 +422,7 @@ impl File {
         offset: usize,
         buffer_size: usize,
         mid: u8,
-    ) -> FrozenResult<()> {
+    ) -> FRes<()> {
         // sanity checks
         #[cfg(debug_assertions)]
         {
@@ -541,7 +523,7 @@ impl File {
 
     /// Acquire an exclusive write lock to [`File`]
     #[inline]
-    pub(super) unsafe fn lock(&self, mid: u8) -> FrozenResult<()> {
+    pub(super) unsafe fn lock(&self, mid: u8) -> FRes<()> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
         self.flock_impl(F_WRLCK, mid)
@@ -549,14 +531,14 @@ impl File {
 
     /// Release the acquired lock (shared/exclusive) for [`File`]
     #[inline]
-    pub(super) unsafe fn unlock(&self, mid: u8) -> FrozenResult<()> {
+    pub(super) unsafe fn unlock(&self, mid: u8) -> FRes<()> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
         self.flock_impl(F_UNLCK, mid)
     }
 
     #[inline]
-    unsafe fn flock_impl(&self, lock_type: c_int, mid: u8) -> FrozenResult<()> {
+    unsafe fn flock_impl(&self, lock_type: c_int, mid: u8) -> FRes<()> {
         let mut fl = flock {
             l_type: lock_type as c_short,
             l_whence: SEEK_SET as c_short,
@@ -598,7 +580,7 @@ impl File {
 ///
 /// To remain sane across ownership models, containers, and shared filesystems,
 /// we explicitly retry the `open()` w/o `O_NOATIME` when `EPERM` is encountered
-unsafe fn open_with_flags(path: &PathBuf, mut flags: i32, mid: u8) -> FrozenResult<i32> {
+unsafe fn open_with_flags(path: &PathBuf, mut flags: i32, mid: u8) -> FRes<i32> {
     let cpath = path_to_cstring(path, mid)?;
     let mut tried_noatime = false;
 
@@ -667,7 +649,7 @@ const fn prep_flags(is_new: bool) -> i32 {
     BASE | ((is_new as i32) * NEW)
 }
 
-fn path_to_cstring(path: &std::path::PathBuf, mid: u8) -> FrozenResult<CString> {
+fn path_to_cstring(path: &std::path::PathBuf, mid: u8) -> FRes<CString> {
     match CString::new(path.as_os_str().as_bytes()) {
         Ok(cs) => Ok(cs),
         Err(e) => {
@@ -685,6 +667,7 @@ fn last_os_error() -> std::io::Error {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use fe::FEAsOk;
     use std::path::PathBuf;
     use tempfile::{tempdir, TempDir};
 
@@ -709,7 +692,7 @@ mod tests {
 
             // sanity check
             assert!(tmp.exists());
-            assert!(unsafe { file.close(MID).is_ok() });
+            assert!(unsafe { file.close(MID).check_ok() });
         }
 
         #[test]
@@ -717,12 +700,12 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
             unsafe {
                 assert!(file.fd() >= 0);
-                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).check_ok());
 
                 match File::new(&tmp, false, MID) {
                     Ok(file) => {
                         assert!(file.fd() >= 0);
-                        assert!(file.close(MID).is_ok());
+                        assert!(file.close(MID).check_ok());
                     }
                     Err(e) => panic!("failed to open file due to E: {:?}", e),
                 }
@@ -735,8 +718,8 @@ mod tests {
 
             unsafe {
                 assert!(file.fd() >= 0);
-                assert!(file.close(MID).is_ok());
-                assert!(file.unlink(&tmp, MID).is_ok());
+                assert!(file.close(MID).check_ok());
+                assert!(file.unlink(&tmp, MID).check_ok());
 
                 let file = File::new(&tmp, false, MID);
                 assert!(file.is_err());
@@ -752,7 +735,7 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
 
             unsafe {
-                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).check_ok());
 
                 // sanity check
                 assert!(tmp.exists());
@@ -765,9 +748,9 @@ mod tests {
 
             unsafe {
                 // should never fail
-                assert!(file.close(MID).is_ok());
-                assert!(file.close(MID).is_ok());
-                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).check_ok());
+                assert!(file.close(MID).check_ok());
+                assert!(file.close(MID).check_ok());
 
                 // sanity check
                 assert!(tmp.exists());
@@ -786,8 +769,8 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
 
             unsafe {
-                assert!(file.sync(MID).is_ok());
-                assert!(file.close(MID).is_ok());
+                assert!(file.sync(MID).check_ok());
+                assert!(file.close(MID).check_ok());
             }
         }
     }
@@ -800,8 +783,8 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
 
             unsafe {
-                assert!(file.close(MID).is_ok());
-                assert!(file.unlink(&tmp, MID).is_ok());
+                assert!(file.close(MID).check_ok());
+                assert!(file.unlink(&tmp, MID).check_ok());
                 assert!(!tmp.exists());
             }
         }
@@ -811,8 +794,8 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
 
             unsafe {
-                assert!(file.close(MID).is_ok());
-                assert!(file.unlink(&tmp, MID).is_ok());
+                assert!(file.close(MID).check_ok());
+                assert!(file.unlink(&tmp, MID).check_ok());
                 assert!(!tmp.exists());
 
                 // should fail on missing
@@ -830,11 +813,11 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
 
             unsafe {
-                assert!(file.resize(NEW_LEN, MID).is_ok());
+                assert!(file.resize(NEW_LEN, MID).check_ok());
 
                 let curr_len = file.metadata(MID).expect("fetch metadata").st_size;
                 assert_eq!(curr_len, NEW_LEN as i64);
-                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).check_ok());
             }
 
             // strict sanity check to ensure file is zero byte extended
@@ -852,13 +835,13 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
 
             unsafe {
-                assert!(file.resize(NEW_LEN, MID).is_ok());
+                assert!(file.resize(NEW_LEN, MID).check_ok());
 
                 let curr_len = file.metadata(MID).expect("fetch metadata").st_size;
                 assert_eq!(curr_len, NEW_LEN as i64);
 
-                assert!(file.sync(MID).is_ok());
-                assert!(file.close(MID).is_ok());
+                assert!(file.sync(MID).check_ok());
+                assert!(file.close(MID).check_ok());
 
                 match File::new(&tmp, false, MID) {
                     Err(e) => panic!("{:?}", e),
@@ -879,13 +862,13 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
 
             unsafe {
-                assert!(file.lock(MID).is_ok());
-                assert!(file.unlock(MID).is_ok());
+                assert!(file.lock(MID).check_ok());
+                assert!(file.unlock(MID).check_ok());
 
-                assert!(file.lock(MID).is_ok());
-                assert!(file.unlock(MID).is_ok());
+                assert!(file.lock(MID).check_ok());
+                assert!(file.unlock(MID).check_ok());
 
-                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).check_ok());
             }
         }
 
@@ -894,14 +877,14 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
 
             unsafe {
-                assert!(file.lock(MID).is_ok());
+                assert!(file.lock(MID).check_ok());
 
                 let data = vec![1u8; 0x20];
                 file.resize(data.len() as u64, MID).expect("resize file");
                 file.pwrite(data.as_ptr(), 0, data.len(), MID).expect("write to file");
 
-                assert!(file.unlock(MID).is_ok());
-                assert!(file.close(MID).is_ok());
+                assert!(file.unlock(MID).check_ok());
+                assert!(file.close(MID).check_ok());
             }
         }
     }
@@ -918,12 +901,12 @@ mod tests {
 
             unsafe {
                 file.resize(LEN as u64, MID).expect("resize file");
-                assert!(file.pwrite(DATA.as_ptr(), 0, LEN, MID).is_ok());
+                assert!(file.pwrite(DATA.as_ptr(), 0, LEN, MID).check_ok());
 
                 let mut buf = vec![0u8; LEN];
-                assert!(file.pread(buf.as_mut_ptr(), 0, LEN, MID).is_ok());
+                assert!(file.pread(buf.as_mut_ptr(), 0, LEN, MID).check_ok());
                 assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
-                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).check_ok());
             }
         }
 
@@ -939,17 +922,20 @@ mod tests {
 
             unsafe {
                 file.resize(total_len as u64, MID).expect("resize file");
-                assert!(file.pwritev(&ptrs, 0, LEN, MID).is_ok());
+                assert!(file.pwritev(&ptrs, 0, LEN, MID).check_ok());
 
                 let mut buf = vec![0u8; total_len];
-                assert!(file.pread(buf.as_mut_ptr(), 0, total_len, MID).is_ok(), "pread failed");
+                assert!(
+                    file.pread(buf.as_mut_ptr(), 0, total_len, MID).check_ok(),
+                    "pread failed"
+                );
                 assert_eq!(buf.len(), total_len, "mismatch between read and write");
 
                 for chunk in buf.chunks_exact(LEN) {
                     assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
                 }
 
-                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).check_ok());
             }
         }
 
@@ -962,11 +948,11 @@ mod tests {
 
             // create + write + sync + close
             unsafe {
-                assert!(file.resize(LEN as u64, MID).is_ok());
-                assert!(file.pwrite(DATA.as_ptr(), 0, LEN, MID).is_ok());
+                assert!(file.resize(LEN as u64, MID).check_ok());
+                assert!(file.pwrite(DATA.as_ptr(), 0, LEN, MID).check_ok());
 
-                assert!(file.sync(MID).is_ok());
-                assert!(file.close(MID).is_ok());
+                assert!(file.sync(MID).check_ok());
+                assert!(file.close(MID).check_ok());
             }
 
             // open + read + verify
@@ -974,9 +960,9 @@ mod tests {
                 let mut buf = vec![0u8; LEN];
                 let file = File::new(&tmp, false, MID).expect("open file");
 
-                assert!(file.pread(buf.as_mut_ptr(), 0, LEN, MID).is_ok());
+                assert!(file.pread(buf.as_mut_ptr(), 0, LEN, MID).check_ok());
                 assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
-                assert!(file.close(MID).is_ok());
+                assert!(file.close(MID).check_ok());
             }
         }
     }
@@ -1005,7 +991,12 @@ mod tests {
             }
 
             for h in handles {
-                assert!(h.join().is_ok());
+                assert!(h
+                    .join()
+                    .map_err(|e| {
+                        eprintln!("\n{:?}\n", e);
+                    })
+                    .is_ok());
             }
 
             //
@@ -1013,7 +1004,7 @@ mod tests {
             //
 
             let mut read_buf = vec![0u8; THREADS * CHUNK];
-            unsafe { assert!(file.pread(read_buf.as_mut_ptr(), 0, read_buf.len(), MID).is_ok()) };
+            unsafe { assert!(file.pread(read_buf.as_mut_ptr(), 0, read_buf.len(), MID).check_ok()) };
 
             for i in 0..THREADS {
                 let chunk = &read_buf[i * CHUNK..(i + 1) * CHUNK];
@@ -1037,12 +1028,17 @@ mod tests {
                 handles.push(std::thread::spawn(move || unsafe {
                     let _guard = f.lock(MID).expect("lock");
                     let data = vec![0xAB; LEN];
-                    assert!(f.pwrite(data.as_ptr(), 0, LEN, MID).is_ok());
+                    assert!(f.pwrite(data.as_ptr(), 0, LEN, MID).check_ok());
                 }));
             }
 
             for h in handles {
-                assert!(h.join().is_ok());
+                assert!(h
+                    .join()
+                    .map_err(|e| {
+                        eprintln!("\n{:?}\n", e);
+                    })
+                    .is_ok());
             }
         }
     }

@@ -1,15 +1,39 @@
-pub type FrozenErrCode = u32;
-pub type FrozenResult<T> = Result<T, FrozenError>;
+//!
+//! Custom errors implementation for Frozen Codebases
+//!
+
+pub type FECode = u32;
+pub type FRes<T> = Result<T, FErr>;
+
+pub trait FEAsOk {
+    fn check_ok(self) -> bool;
+}
+
+impl<T> FEAsOk for Result<T, FErr> {
+    #[inline]
+    #[allow(unused)]
+    fn check_ok(self) -> bool {
+        const SEPERATOR: &'static str = "\n----------\n";
+        match self {
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                eprintln!("{SEPERATOR}FErr {{ code: {}, msg: {} }}{SEPERATOR}", e.code, e.msg);
+                false
+            }
+            Ok(_) => true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct FrozenError {
-    pub code: FrozenErrCode,
+pub struct FErr {
+    pub code: FECode,
     pub msg: std::borrow::Cow<'static, str>,
 }
 
-impl FrozenError {
+impl FErr {
     #[inline]
-    pub fn new(code: FrozenErrCode, msg: &'static str) -> Self {
+    pub fn new(code: FECode, msg: &'static str) -> Self {
         Self {
             code,
             msg: std::borrow::Cow::Borrowed(msg),
@@ -17,7 +41,7 @@ impl FrozenError {
     }
 
     #[inline]
-    pub fn with_msg(code: FrozenErrCode, msg: String) -> Self {
+    pub fn with_msg(code: FECode, msg: String) -> Self {
         Self {
             code,
             msg: std::borrow::Cow::Owned(msg),
@@ -25,7 +49,7 @@ impl FrozenError {
     }
 
     #[inline]
-    pub fn with_err<E>(code: FrozenErrCode, err: E) -> Self
+    pub fn with_err<E>(code: FECode, err: E) -> Self
     where
         E: std::fmt::Display,
     {
@@ -36,13 +60,13 @@ impl FrozenError {
     }
 }
 
-/// Construct an [`FrozenErrCode`] from raw values
+/// Construct an [`FECode`] from raw values
 ///
 /// ## Notes
 ///
 /// - Moudle should be <= 16
 /// - Domain should be >= 17 && <= 32
-pub const fn new_err_code(module: u8, domain: u8, reason: u16) -> FrozenErrCode {
+pub const fn new_err_code(module: u8, domain: u8, reason: u16) -> FECode {
     // sanity check
     debug_assert!(module <= 0x10, "Module should be 0-16");
     debug_assert!(domain >= 0x11 && domain <= 0x20, "Domain should be 17-32");
@@ -50,10 +74,10 @@ pub const fn new_err_code(module: u8, domain: u8, reason: u16) -> FrozenErrCode 
     ((module as u32) << 24) | ((domain as u32) << 16) | (reason as u32)
 }
 
-pub fn from_err_code(code: FrozenErrCode) -> (u8, u8, u16) {
-    let module = (code >> 24) as u8;
-    let domain = (code >> 16) as u8;
+pub fn from_err_code(code: FECode) -> (u8, u8, u16) {
     let reason = code as u16;
+    let domain = (code >> 16) as u8;
+    let module = (code >> 24) as u8;
 
     (module, domain, reason)
 }
@@ -67,8 +91,8 @@ fn err_code_roundtrip() {
     let code = new_err_code(module, domain, reason);
     let (m, d, r) = from_err_code(code);
 
-    assert_eq!(code, 0x0A15BEEF);
     assert_eq!(m, module);
     assert_eq!(d, domain);
     assert_eq!(r, reason);
+    assert_eq!(code, 0x0A15BEEF);
 }

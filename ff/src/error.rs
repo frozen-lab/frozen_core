@@ -1,12 +1,12 @@
-use fe::{FrozenError, FrozenResult};
+use fe::{FErr, FRes};
 
 /// Domain Id for [`ff`] is **17**
 const ERRDOMAIN: u8 = 0x11;
 
 #[inline]
-pub(crate) fn new_error<R>(mid: u8, reason: FFErr, error: std::io::Error) -> FrozenResult<R> {
+pub(crate) fn new_error<R>(mid: u8, reason: FFErr, error: std::io::Error) -> FRes<R> {
     let code = fe::new_err_code(mid, ERRDOMAIN, reason as u16);
-    let err = FrozenError::with_err(code, error);
+    let err = FErr::with_err(code, error);
     Err(err)
 }
 
