@@ -11,12 +11,10 @@ pub trait FEAsOk {
 
 impl<T> FEAsOk for Result<T, FErr> {
     #[inline]
-    #[allow(unused)]
     fn check_ok(self) -> bool {
         const SEPERATOR: &'static str = "\n----------\n";
         match self {
             Err(e) => {
-                #[cfg(debug_assertions)]
                 eprintln!("{SEPERATOR}FErr {{ code: {}, msg: {} }}{SEPERATOR}", e.code, e.msg);
                 false
             }

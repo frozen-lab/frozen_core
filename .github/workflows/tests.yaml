@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+  # allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  unit_tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: ubuntu-latest
+            arch: x86_64
+          # - os: ubuntu-24.04-arm
+          #   arch: aarch64
+          # - os: windows-latest
+          #   arch: x86_64
+          # - os: windows-11-arm
+          #   arch: aarch64
+          # - os: macos-13
+          #   arch: x86_64
+          # - os: macos-latest
+          #   arch: aarch64
+        crate:
+          - fe
+          - ff
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache-key: ${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Test ${{ matrix.crate }}
+        run: cargo test --release -p ${{ matrix.crate }} -- --nocapture
