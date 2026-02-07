@@ -126,3 +126,237 @@ impl MMap {
 fn last_os_error() -> std::io::Error {
     std::io::Error::last_os_error()
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use fe::FECheckOk;
+    use ff::{FFCfg, FF};
+    use std::path::PathBuf;
+    use tempfile::{tempdir, TempDir};
+
+    const MID: u8 = 0x00; // module id (test)
+    const LEN: usize = 0x80;
+
+    fn get_ff_cfg(path: PathBuf) -> FFCfg {
+        FFCfg {
+            path,
+            module_id: MID,
+            auto_flush: false,
+            flush_duration: std::time::Duration::from_secs(1),
+        }
+    }
+
+    fn new_tmp() -> (TempDir, PathBuf, FF, MMap) {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        unsafe {
+            let file = FF::new(get_ff_cfg(tmp.clone()), LEN as u64).expect("new FF");
+            let mmap = MMap::new(file.fd(), LEN, MID).expect("new MMap");
+
+            (dir, tmp, file, mmap)
+        }
+    }
+
+    mod map_unmap {
+        use super::*;
+
+        #[test]
+        fn map_unmap_cycle() {
+            let (_dir, _tmp, _file, map) = new_tmp();
+
+            assert!(!map.0.is_null());
+            assert!(unsafe { map.unmap(LEN, MID) }.check_ok());
+        }
+
+        #[test]
+        fn map_fails_on_invalid_fd() {
+            unsafe { assert!(MMap::new(-1, LEN, MID).is_err()) };
+        }
+
+        #[test]
+        fn unmap_after_unmap_does_not_fails() {
+            let (_dir, _tmp, _file, map) = new_tmp();
+
+            unsafe {
+                assert!(map.unmap(LEN, MID).check_ok());
+                assert!(map.unmap(LEN, MID).check_ok());
+                assert!(map.unmap(LEN, MID).check_ok());
+            }
+        }
+    }
+
+    mod sync {
+        use super::*;
+
+        #[test]
+        fn msync_works() {
+            let (_dir, _tmp, _file, map) = new_tmp();
+
+            unsafe {
+                assert!(map.sync(LEN, MID).check_ok());
+                assert!(map.unmap(LEN, MID).check_ok());
+            }
+        }
+    }
+
+    mod write_read {
+        use super::*;
+
+        #[test]
+        fn write_read_cycle() {
+            let (_dir, _tmp, _file, map) = new_tmp();
+
+            unsafe {
+                // write + sync
+                let ptr = map.get_mut::<u64>(0);
+                *ptr = 0xDEAD_C0DE_DEAD_C0DE;
+                assert!(map.sync(LEN, MID).check_ok());
+
+                // read + validate
+                let val = *map.get::<u64>(0);
+                assert_eq!(val, 0xDEAD_C0DE_DEAD_C0DE);
+
+                assert!(map.unmap(LEN, MID).check_ok());
+            }
+        }
+
+        #[test]
+        fn write_read_across_sessions() {
+            let (_dir, tmp, file, map) = new_tmp();
+
+            // write + sync + unmap + close
+            unsafe {
+                let ptr = map.get_mut::<u64>(0);
+                *ptr = 0xDEAD_C0DE_DEAD_C0DE;
+                assert!(map.sync(LEN, MID).check_ok());
+
+                assert!(map.unmap(LEN, MID).check_ok());
+                drop(file);
+            }
+
+            // open + map + read + validate
+            unsafe {
+                let file = FF::open(get_ff_cfg(tmp)).expect("open existing");
+                let map = MMap::new(file.fd(), LEN, MID).expect("new mmap");
+
+                // read + validate
+                let val = *map.get::<u64>(0);
+                assert_eq!(val, 0xDEAD_C0DE_DEAD_C0DE);
+
+                assert!(map.unmap(LEN, MID).check_ok());
+            }
+        }
+
+        #[test]
+        fn mmap_write_is_in_synced_with_file_read() {
+            let (_dir, _tmp, file, map) = new_tmp();
+
+            unsafe {
+                // write + sync
+                let ptr = map.get_mut::<u64>(0);
+                *ptr = 0xDEAD_C0DE_DEAD_C0DE;
+                assert!(map.sync(LEN, MID).check_ok());
+
+                // pread
+                let mut buf = [0u8; 8];
+                file.read(buf.as_mut_ptr(), 0, 8).expect("failed to read");
+                assert_eq!(u64::from_le_bytes(buf), 0xDEAD_C0DE_DEAD_C0DE);
+
+                assert!(map.unmap(LEN, MID).check_ok());
+            }
+        }
+    }
+
+    mod concurrency {
+        use super::*;
+
+        #[test]
+        fn munmap_is_thread_safe() {
+            let (_dir, _tmp, _file, map) = new_tmp();
+
+            let mut handles = Vec::new();
+            let map = std::sync::Arc::new(map);
+
+            for _ in 0..8 {
+                let m = map.clone();
+                handles.push(std::thread::spawn(move || unsafe {
+                    assert!(m.unmap(LEN, MID).check_ok());
+                }));
+            }
+
+            for h in handles {
+                assert!(h
+                    .join()
+                    .map_err(|e| {
+                        eprintln!("\n{:?}\n", e);
+                    })
+                    .is_ok());
+            }
+        }
+
+        #[test]
+        fn msync_is_thread_safe() {
+            let (_dir, _tmp, _file, map) = new_tmp();
+
+            let mut handles = Vec::new();
+            let map = std::sync::Arc::new(map);
+
+            unsafe {
+                *map.get_mut::<u64>(0) = 42;
+            }
+
+            for _ in 0..8 {
+                let m = map.clone();
+                handles.push(std::thread::spawn(move || unsafe {
+                    assert!(m.sync(LEN, MID).check_ok());
+                }));
+            }
+
+            for h in handles {
+                assert!(h
+                    .join()
+                    .map_err(|e| {
+                        eprintln!("\n{:?}\n", e);
+                    })
+                    .is_ok());
+            }
+
+            unsafe {
+                assert_eq!(*map.get::<u64>(0), 42);
+                assert!(map.unmap(LEN, MID).check_ok());
+            }
+        }
+
+        #[test]
+        fn concurrent_writes_then_sync() {
+            let (_dir, _tmp, _file, map) = new_tmp();
+
+            let mut handles = Vec::new();
+            let map = std::sync::Arc::new(map);
+
+            for i in 0..8u64 {
+                let m = map.clone();
+                handles.push(std::thread::spawn(move || unsafe {
+                    let ptr = m.get_mut::<u64>(0);
+                    *ptr = i;
+                }));
+            }
+
+            for h in handles {
+                assert!(h
+                    .join()
+                    .map_err(|e| {
+                        eprintln!("\n{:?}\n", e);
+                    })
+                    .is_ok());
+            }
+
+            unsafe {
+                assert!(map.sync(LEN, MID).check_ok());
+                assert!(map.unmap(LEN, MID).check_ok());
+            }
+        }
+    }
+}

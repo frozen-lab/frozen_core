@@ -429,7 +429,7 @@ impl Core {
 #[cfg(all(test, target_os = "linux"))]
 mod ff_tests {
     use super::*;
-    use fe::FEAsOk;
+    use fe::FECheckOk;
     use std::{path::PathBuf, sync::Arc, time::Duration};
     use tempfile::{tempdir, TempDir};
 

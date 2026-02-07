@@ -606,7 +606,7 @@ fn last_os_error() -> std::io::Error {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use fe::FEAsOk;
+    use fe::FECheckOk;
     use std::path::PathBuf;
     use tempfile::{tempdir, TempDir};
 

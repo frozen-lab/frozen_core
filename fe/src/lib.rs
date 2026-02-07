@@ -5,11 +5,11 @@
 pub type FECode = u32;
 pub type FRes<T> = Result<T, FErr>;
 
-pub trait FEAsOk {
+pub trait FECheckOk {
     fn check_ok(self) -> bool;
 }
 
-impl<T> FEAsOk for Result<T, FErr> {
+impl<T> FECheckOk for Result<T, FErr> {
     #[inline]
     fn check_ok(self) -> bool {
         const SEPERATOR: &'static str = "\n----------\n";

@@ -48,6 +48,7 @@ name = "fm"
 version = "0.1.0"
 dependencies = [
  "fe",
+ "ff",
  "libc",
  "tempfile",
 ]
