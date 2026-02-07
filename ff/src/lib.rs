@@ -3,19 +3,15 @@
 
 //! Custom implementation of File
 
+mod error;
 #[cfg(target_os = "linux")]
 mod linux;
 
-mod error;
 pub use error::FFErr;
 
-use fe::FRes;
-use std::{
-    cell::UnsafeCell,
-    mem::ManuallyDrop,
-    path::PathBuf,
-    sync::{atomic, mpsc, Arc, Condvar, Mutex},
-};
+use error::{new_error, raw_err_with_msg, raw_error};
+use fe::{FErr, FRes};
+use std::{cell, mem, sync, sync::atomic, thread};
 
 #[cfg(target_os = "linux")]
 type FFile = linux::File;
@@ -23,23 +19,41 @@ type FFile = linux::File;
 #[cfg(not(target_os = "linux"))]
 type FFile = ();
 
+/// Config for [`FF`]
+#[derive(Clone)]
+pub struct FFCfg {
+    /// module id (used for error codes)
+    pub module_id: u8,
+
+    /// when true, all dirty pages would be automatically be synced by a
+    /// background thread
+    pub auto_flush: bool,
+
+    /// Path of the file
+    pub path: std::path::PathBuf,
+
+    /// time interval for sync to flush dirty pages
+    pub flush_duration: std::time::Duration,
+}
+
 /// Custom implementation of File
-pub struct FF(Arc<Core>);
+pub struct FF(sync::Arc<Core>);
 
 unsafe impl Send for FF {}
 unsafe impl Sync for FF {}
 
 impl FF {
     /// Create new [`FF`] w/ specified length
-    pub fn new(path: &PathBuf, length: u64, auto_flush: bool, module_id: u8) -> FRes<Self> {
+    pub fn new(cfg: FFCfg, length: u64) -> FRes<Self> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        let file = unsafe { linux::File::new(path, true, module_id) }?;
-        let init_res = unsafe { file.resize(length, module_id) };
+        let file = unsafe { linux::File::new(&cfg.path, true, cfg.module_id) }?;
+        let init_res = unsafe { file.resize(length, cfg.module_id) };
+        let max_iovecs = unsafe { file.max_iovecs() };
 
-        let core = Arc::new(Core::new(file, length, auto_flush));
+        let core = sync::Arc::new(Core::new(file, cfg.clone(), length, max_iovecs));
         let ff = Self(core.clone());
 
         if let Err(e) = init_res {
@@ -49,46 +63,364 @@ impl FF {
             return Err(e);
         }
 
+        if cfg.auto_flush {
+            Core::spawn_tx(core)?;
+        }
+
         Ok(ff)
+    }
+
+    /// Open an existing `[FF]`
+    pub fn open(cfg: FFCfg) -> FRes<Self> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        let file = unsafe { linux::File::new(&cfg.path, false, cfg.module_id) }?;
+
+        let length = unsafe { file.length(cfg.module_id) }?;
+        let max_iovecs = unsafe { file.max_iovecs() };
+
+        let core = sync::Arc::new(Core::new(file, cfg.clone(), length, max_iovecs));
+        let ff = Self(core.clone());
+
+        if cfg.auto_flush {
+            Core::spawn_tx(core)?;
+        }
+
+        Ok(ff)
+    }
+
+    /// Resize [`FF`] w/ `new_len`
+    pub fn resize(&self, new_len: u64) -> FRes<()> {
+        // sanity checks
+        self.sanity_check()?;
+        debug_assert!(new_len > self.length());
+
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.get_file().resize(new_len, self.0.cfg.module_id)
+        }
+    }
+
+    /// current length of [`FF`]
+    #[inline]
+    pub fn length(&self) -> u64 {
+        self.0.length.load(atomic::Ordering::Acquire)
+    }
+
+    /// get file descriptor for [`FF`]
+    #[inline]
+    #[cfg(target_os = "linux")]
+    pub fn fd(&self) -> i32 {
+        self.get_file().fd()
+    }
+
+    /// Syncs in-mem data on the storage device
+    #[inline]
+    pub fn sync(&self) -> FRes<()> {
+        // sanity check
+        self.sanity_check()?;
+        self.0.sync()
     }
 
     /// Delete [`FF`] from filesystem
     ///
     /// _NOTE:_ Closing [`FF`] beforehand is not required
     pub fn delete(&self) -> FRes<()> {
-        todo!()
+        let file = self.get_file();
+
+        // NOTE: sanity check is invalid here, cause we are deleting the file, hence we don't
+        // actually care if the state is sane or not ;)
+
+        // mark file as close
+        self.0.closed.store(true, atomic::Ordering::Release);
+
+        // close flusher thread
+        if self.0.cfg.auto_flush {
+            self.0.cv.notify_one();
+        }
+
+        // NOTE: we must wait for sync thread to exit to avoid use of operations using
+        // invalid fd (which is after close, i.e. fd = -1)
+        if let Err(error) = self.0.lock.lock() {
+            return new_error(self.0.cfg.module_id, FFErr::Mpn, error);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            match file.close(self.0.cfg.module_id) {
+                Ok(_) => file.unlink(&self.0.cfg.path, self.0.cfg.module_id),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    /// Read at given `offset` from [`FF`]
+    #[inline]
+    pub fn read(&self, buf_ptr: *mut u8, offset: usize, len_to_read: usize) -> FRes<()> {
+        // sanity check
+        self.sanity_check()?;
+
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.get_file()
+                .pread(buf_ptr, offset, len_to_read, self.0.cfg.module_id)
+        }
+    }
+
+    /// Read (multiple vectors) at given `offset` from [`FF`]
+    #[inline]
+    pub fn readv(&self, buf_ptrs: &[*mut u8], offset: usize, len_to_read: usize) -> FRes<()> {
+        // sanity checks
+        self.sanity_check()?;
+        debug_assert!(buf_ptrs.len() <= self.0.max_iovecs);
+
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.get_file()
+                .preadv(buf_ptrs, offset, len_to_read, self.0.cfg.module_id)
+        }
+    }
+
+    /// Write at given `offset` to [`FF`]
+    #[inline]
+    pub fn write(&self, buf_ptr: *const u8, offset: usize, len_to_write: usize) -> FRes<()> {
+        // sanity check
+        self.sanity_check()?;
+        debug_assert!(offset + len_to_write <= self.length() as usize);
+
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.get_file()
+                .pwrite(buf_ptr, offset, len_to_write, self.0.cfg.module_id)
+        }?;
+
+        self.0.dirty.store(true, atomic::Ordering::Release);
+        self.0.cv.notify_one();
+        Ok(())
+    }
+
+    /// Write (multiple vectors) at given `offset` to [`FF`]
+    #[inline]
+    pub fn writev(&self, buf_ptrs: &[*const u8], offset: usize, buffer_size: usize) -> FRes<()> {
+        // sanity check
+        self.sanity_check()?;
+        debug_assert!(buf_ptrs.len() <= self.0.max_iovecs);
+        debug_assert!(offset + (buf_ptrs.len() * buffer_size) <= self.length() as usize);
+
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.get_file()
+                .pwritev(buf_ptrs, offset, buffer_size, self.0.cfg.module_id)
+        }?;
+
+        self.0.dirty.store(true, atomic::Ordering::Release);
+        self.0.cv.notify_one();
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn sanity_check(&self) -> FRes<()> {
+        if let Some(err) = self.0.error.get() {
+            return Err(err.clone());
+        }
+
+        if self.0.closed.load(atomic::Ordering::Acquire) {
+            let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Trying to access closed FF");
+            return new_error(self.0.cfg.module_id, FFErr::Hcf, error);
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn get_file(&self) -> &mem::ManuallyDrop<FFile> {
+        unsafe { &*self.0.file.get() }
+    }
+}
+
+impl Drop for FF {
+    fn drop(&mut self) {
+        if self.0.closed.swap(true, atomic::Ordering::AcqRel) {
+            return;
+        }
+
+        // close flusher thread
+        if self.0.cfg.auto_flush {
+            self.0.cv.notify_one();
+        }
+
+        // sync if dirty
+        let _ = self.0.sync();
+
+        let _ = unsafe { self.get_file().close(self.0.cfg.module_id) };
+    }
+}
+
+impl std::fmt::Display for FF {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        write!(
+            f,
+            "FF {{fd: {}, len: {}, id: {}, mode: {}, has_error: {}}}",
+            self.fd(),
+            self.length(),
+            self.0.cfg.module_id,
+            self.0.cfg.auto_flush,
+            self.0.error.get().is_some(),
+        )
     }
 }
 
 struct Core {
-    cv: Condvar,
-    lock: Mutex<()>,
-    auto_flush: bool,
-    length: atomic::AtomicU64,
-    version: atomic::AtomicU8,
+    cfg: FFCfg,
+    cv: sync::Condvar,
+    lock: sync::Mutex<()>,
+    max_iovecs: usize,
+    error: sync::OnceLock<FErr>,
     dirty: atomic::AtomicBool,
     closed: atomic::AtomicBool,
-    errored: atomic::AtomicBool,
-    err_code: atomic::AtomicU16,
-    file: UnsafeCell<ManuallyDrop<FFile>>,
+    length: atomic::AtomicU64,
+    file: cell::UnsafeCell<mem::ManuallyDrop<FFile>>,
 }
 
 unsafe impl Send for Core {}
 unsafe impl Sync for Core {}
 
 impl Core {
-    fn new(file: FFile, length: u64, auto_flush: bool) -> Self {
+    fn new(file: FFile, cfg: FFCfg, length: u64, max_iovecs: usize) -> Self {
         Self {
-            auto_flush,
-            cv: Condvar::new(),
-            lock: Mutex::new(()),
-            version: atomic::AtomicU8::new(0),
-            err_code: atomic::AtomicU16::new(0),
+            cfg,
+            max_iovecs,
+            cv: sync::Condvar::new(),
+            lock: sync::Mutex::new(()),
+            error: sync::OnceLock::new(),
             dirty: atomic::AtomicBool::new(false),
             closed: atomic::AtomicBool::new(false),
             length: atomic::AtomicU64::new(length),
-            errored: atomic::AtomicBool::new(false),
-            file: UnsafeCell::new(ManuallyDrop::new(file)),
+            file: cell::UnsafeCell::new(mem::ManuallyDrop::new(file)),
+        }
+    }
+
+    #[inline]
+    fn sync(&self) -> FRes<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            (&*self.file.get()).sync(self.cfg.module_id)
+        }
+    }
+
+    fn spawn_tx(core: sync::Arc<Self>) -> FRes<()> {
+        let mid = core.cfg.module_id;
+        let (tx, rx) = sync::mpsc::sync_channel::<FRes<()>>(1);
+
+        if let Err(error) = thread::Builder::new()
+            .name("ff-flush-tx".into())
+            .spawn(move || Self::tx_thread(core, tx))
+        {
+            return Err(raw_err_with_msg(
+                mid,
+                error,
+                FFErr::Mpn,
+                "Failed to spawn flush thread for FF",
+            ));
+        }
+
+        if let Err(error) = rx.recv() {
+            return Err(raw_err_with_msg(
+                mid,
+                error,
+                FFErr::Unk,
+                "Flush thread died before init could be completed for FF",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn tx_thread(core: sync::Arc<Self>, init: sync::mpsc::SyncSender<FRes<()>>) {
+        // init phase (acquiring locks)
+        let mut guard = match core.lock.lock() {
+            Ok(g) => {
+                // NOTE: We can supress the error here, as this may never panic, unless the receiver
+                // is shut, which is preveneted by design
+                let _ = init.send(Ok(()));
+                g
+            }
+            Err(error) => {
+                if let Err(err) = init.send(new_error(core.cfg.module_id, FFErr::Unk, error)) {
+                    let error = raw_err_with_msg(
+                        core.cfg.module_id,
+                        err,
+                        FFErr::Unk,
+                        "Flush thread died before init could be completed for FF",
+                    );
+                    let _ = core.error.set(error);
+                }
+                return;
+            }
+        };
+
+        // init done, now is detached from thread
+        drop(init);
+
+        // sync loop w/ non-busy waiting
+        loop {
+            guard = match core.cv.wait_timeout(guard, core.cfg.flush_duration) {
+                Ok((g, _)) => g,
+                Err(e) => {
+                    let error = raw_error(core.cfg.module_id, FFErr::Tpn, e);
+                    let _ = core.error.set(error);
+                    return;
+                }
+            };
+
+            if core.closed.load(atomic::Ordering::Acquire) {
+                return;
+            }
+
+            if core.dirty.swap(false, atomic::Ordering::AcqRel) {
+                drop(guard);
+
+                if let Err(error) = core.sync() {
+                    let _ = core.error.set(error);
+                    return;
+                }
+
+                guard = match core.lock.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        let error = raw_error(core.cfg.module_id, FFErr::Tpn, e);
+                        let _ = core.error.set(error);
+                        return;
+                    }
+                };
+            }
         }
     }
 }
