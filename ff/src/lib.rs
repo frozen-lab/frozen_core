@@ -101,9 +101,10 @@ impl FF {
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        unsafe {
-            self.get_file().resize(new_len, self.0.cfg.module_id)
-        }
+        unsafe { self.get_file().resize(new_len, self.0.cfg.module_id) }?;
+
+        self.0.length.store(new_len, atomic::Ordering::Release);
+        Ok(())
     }
 
     /// current length of [`FF`]
@@ -421,6 +422,211 @@ impl Core {
                     }
                 };
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod ff_tests {
+    use super::*;
+    use fe::FEAsOk;
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use tempfile::{tempdir, TempDir};
+
+    const MID: u8 = 0x00;
+    const LEN: usize = 0x20;
+    const FLUSH: Duration = Duration::from_millis(50);
+
+    fn new_cfg(path: PathBuf) -> FFCfg {
+        FFCfg {
+            module_id: MID,
+            auto_flush: false,
+            path,
+            flush_duration: FLUSH,
+        }
+    }
+
+    fn new_tmp(auto_flush: bool) -> (TempDir, PathBuf, FF) {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("tmp_file");
+
+        let cfg = FFCfg {
+            module_id: MID,
+            auto_flush,
+            path: path.clone(),
+            flush_duration: FLUSH,
+        };
+
+        let ff = FF::new(cfg, LEN as u64).expect("new FF");
+        (dir, path, ff)
+    }
+
+    mod new_open {
+        use super::*;
+
+        #[test]
+        fn new_works() {
+            let (_dir, path, ff) = new_tmp(false);
+
+            assert!(ff.fd() >= 0);
+            assert_eq!(ff.length(), LEN as u64);
+            assert!(path.exists());
+        }
+
+        #[test]
+        fn open_works() {
+            let (_dir, path, ff) = new_tmp(false);
+            drop(ff);
+
+            let cfg = new_cfg(path);
+
+            let ff = FF::open(cfg).expect("open FF");
+            assert!(ff.fd() >= 0);
+        }
+
+        #[test]
+        fn open_fails_when_deleted() {
+            let (_dir, path, ff) = new_tmp(false);
+            assert!(ff.delete().check_ok());
+
+            let cfg = new_cfg(path);
+            assert!(FF::open(cfg).is_err());
+        }
+    }
+
+    mod resize {
+        use super::*;
+
+        #[test]
+        fn resize_zero_extends() {
+            let (_dir, path, ff) = new_tmp(false);
+            const NEW_LEN: u64 = 0x80;
+
+            assert!(ff.resize(NEW_LEN).check_ok());
+            assert_eq!(ff.length(), NEW_LEN);
+
+            let data = std::fs::read(&path).expect("read file");
+            assert_eq!(data.len(), NEW_LEN as usize);
+            assert!(data.iter().all(|b| *b == 0));
+        }
+
+        #[test]
+        fn open_preserves_length() {
+            let (_dir, path, ff) = new_tmp(true);
+            const NEW_LEN: u64 = 0x80;
+
+            assert!(ff.resize(NEW_LEN).check_ok());
+            std::thread::sleep(FLUSH * 2);
+            drop(ff);
+
+            let cfg = new_cfg(path);
+            let ff = FF::open(cfg).expect("open FF");
+            assert_eq!(ff.length(), NEW_LEN);
+        }
+    }
+
+    mod write_read {
+        use super::*;
+
+        #[test]
+        fn write_read_cycle() {
+            let (_dir, _path, ff) = new_tmp(false);
+            let data = [0x1Au8; LEN];
+
+            assert!(ff.write(data.as_ptr(), 0, LEN).check_ok());
+
+            let mut buf = vec![0u8; LEN];
+            assert!(ff.read(buf.as_mut_ptr(), 0, LEN).check_ok());
+            assert_eq!(buf, data);
+        }
+
+        #[test]
+        fn writev_read_cycle() {
+            let (_dir, _path, ff) = new_tmp(false);
+            let data = [0x1Au8; LEN];
+            let ptrs = vec![data.as_ptr(); 8];
+
+            let total = ptrs.len() * LEN;
+            assert!(ff.resize(total as u64).check_ok());
+            assert!(ff.writev(&ptrs, 0, LEN).check_ok());
+
+            let mut buf = vec![0u8; total];
+            assert!(ff.read(buf.as_mut_ptr(), 0, total).check_ok());
+
+            for chunk in buf.chunks_exact(LEN) {
+                assert_eq!(chunk, data);
+            }
+        }
+
+        #[test]
+        fn write_persist_across_sessions() {
+            let (_dir, path, ff) = new_tmp(true);
+            let data = [0xABu8; LEN];
+
+            assert!(ff.write(data.as_ptr(), 0, LEN).check_ok());
+            std::thread::sleep(FLUSH * 2);
+            drop(ff);
+
+            let cfg = new_cfg(path);
+            let ff = FF::open(cfg).expect("open FF");
+            let mut buf = vec![0u8; LEN];
+
+            assert!(ff.read(buf.as_mut_ptr(), 0, LEN).check_ok());
+            assert_eq!(buf, data);
+        }
+    }
+
+    mod concurrency {
+        use super::*;
+
+        #[test]
+        fn concurrent_writes_then_read() {
+            const THREADS: usize = 8;
+            const CHUNK: usize = 0x100;
+
+            let (_dir, _path, ff) = new_tmp(false);
+            let ff = Arc::new(ff);
+
+            assert!(ff.resize((THREADS * CHUNK) as u64).check_ok());
+
+            let mut handles = Vec::new();
+            for i in 0..THREADS {
+                let f = ff.clone();
+                handles.push(std::thread::spawn(move || {
+                    let data = vec![i as u8; CHUNK];
+                    f.write(data.as_ptr(), i * CHUNK, CHUNK).expect("write");
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+
+            let mut buf = vec![0u8; THREADS * CHUNK];
+            assert!(ff.read(buf.as_mut_ptr(), 0, buf.len()).check_ok());
+
+            for i in 0..THREADS {
+                let chunk = &buf[i * CHUNK..(i + 1) * CHUNK];
+                assert!(chunk.iter().all(|b| *b == i as u8));
+            }
+        }
+    }
+
+    mod delete {
+        use super::*;
+
+        #[test]
+        fn delete_works() {
+            let (_dir, path, ff) = new_tmp(false);
+            assert!(ff.delete().check_ok());
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn delete_twice_fails() {
+            let (_dir, _path, ff) = new_tmp(false);
+            assert!(ff.delete().check_ok());
+            assert!(ff.delete().is_err());
         }
     }
 }
