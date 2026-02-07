@@ -148,7 +148,7 @@ impl FF {
         // NOTE: we must wait for sync thread to exit to avoid use of operations using
         // invalid fd (which is after close, i.e. fd = -1)
         if let Err(error) = self.0.lock.lock() {
-            return new_error(self.0.cfg.module_id, FFErr::Mpn, error);
+            return new_error(self.0.cfg.module_id, FFErr::Lpn, error);
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -347,7 +347,7 @@ impl Core {
             return Err(raw_err_with_msg(
                 mid,
                 error,
-                FFErr::Mpn,
+                FFErr::Hcf,
                 "Failed to spawn flush thread for FF",
             ));
         }
@@ -356,7 +356,7 @@ impl Core {
             return Err(raw_err_with_msg(
                 mid,
                 error,
-                FFErr::Unk,
+                FFErr::Hcf,
                 "Flush thread died before init could be completed for FF",
             ));
         }
@@ -378,7 +378,7 @@ impl Core {
                     let error = raw_err_with_msg(
                         core.cfg.module_id,
                         err,
-                        FFErr::Unk,
+                        FFErr::Lpn,
                         "Flush thread died before init could be completed for FF",
                     );
                     let _ = core.error.set(error);
@@ -395,7 +395,7 @@ impl Core {
             guard = match core.cv.wait_timeout(guard, core.cfg.flush_duration) {
                 Ok((g, _)) => g,
                 Err(e) => {
-                    let error = raw_error(core.cfg.module_id, FFErr::Tpn, e);
+                    let error = raw_error(core.cfg.module_id, FFErr::Txe, e);
                     let _ = core.error.set(error);
                     return;
                 }
@@ -416,7 +416,7 @@ impl Core {
                 guard = match core.lock.lock() {
                     Ok(g) => g,
                     Err(e) => {
-                        let error = raw_error(core.cfg.module_id, FFErr::Tpn, e);
+                        let error = raw_error(core.cfg.module_id, FFErr::Lpn, e);
                         let _ = core.error.set(error);
                         return;
                     }

@@ -43,27 +43,24 @@ pub enum FFErr {
     /// (258) no more space available
     Nsp = 0x102,
 
-    /// (259) failed to obtain os lock
-    Lck = 0x103,
+    /// (259) unexpected eof
+    Eof = 0x103,
 
-    /// (260) unexpected eof
-    Eof = 0x104,
+    /// (260) syncing error
+    Syn = 0x104,
 
-    /// (261) syncing error
-    Syn = 0x105,
+    /// (261) no write perm
+    Wrt = 0x105,
 
-    /// (262) mutext poisoned
-    Mpn = 0x106,
+    /// (262) no read perm
+    Red = 0x106,
 
-    /// (263) thread poisoned
-    Tpn = 0x107,
+    /// (263) invalid path
+    Inv = 0x107,
 
-    /// (264) no write perm
-    Wrt = 0x108,
+    /// (264) thread error or panic inside thread
+    Txe = 0x108,
 
-    /// (265) no read perm
-    Red = 0x109,
-
-    /// (266) invalid path
-    Inv = 0x10A,
+    /// (265) lock error (failed or poisoned)
+    Lpn = 0x109,
 }
