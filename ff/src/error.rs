@@ -4,10 +4,31 @@ use fe::{FErr, FRes};
 const ERRDOMAIN: u8 = 0x11;
 
 #[inline]
-pub(crate) fn new_error<R>(mid: u8, reason: FFErr, error: std::io::Error) -> FRes<R> {
+pub(crate) fn new_error<E, R>(mid: u8, reason: FFErr, error: E) -> FRes<R>
+where
+    E: std::fmt::Display,
+{
     let code = fe::new_err_code(mid, ERRDOMAIN, reason as u16);
     let err = FErr::with_err(code, error);
     Err(err)
+}
+
+#[inline]
+pub(crate) fn raw_error<E>(mid: u8, reason: FFErr, error: E) -> FErr
+where
+    E: std::fmt::Display,
+{
+    let code = fe::new_err_code(mid, ERRDOMAIN, reason as u16);
+    FErr::with_err(code, error)
+}
+
+#[inline]
+pub(crate) fn raw_err_with_msg<E>(mid: u8, error: E, reason: FFErr, msg: &'static str) -> FErr
+where
+    E: std::fmt::Display,
+{
+    let code = fe::new_err_code(mid, ERRDOMAIN, reason as u16);
+    FErr::with_msg(code, format!("{msg} due to error =>\n{error}"))
 }
 
 /// Error codes for [`FF`]

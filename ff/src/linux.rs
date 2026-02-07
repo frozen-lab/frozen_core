@@ -940,6 +940,35 @@ mod tests {
         }
 
         #[test]
+        fn pwritev_preadv_cycle() {
+            let (_dir, tmp, file) = new_tmp();
+
+            const LEN: usize = 0x20;
+            const DATA: [u8; LEN] = [0x1A; LEN];
+
+            let ptrs = vec![DATA.as_ptr(); 0x10];
+            let total_len = ptrs.len() * LEN;
+
+            unsafe {
+                file.resize(total_len as u64, MID).expect("resize file");
+                assert!(file.pwritev(&ptrs, 0, LEN, MID).check_ok());
+
+                // prepare read buffers
+                let mut bufs: Vec<Vec<u8>> = (0..ptrs.len()).map(|_| vec![0u8; LEN]).collect();
+                let mut buf_ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+
+                assert!(file.preadv(&buf_ptrs, 0, LEN, MID).check_ok(), "preadv failed");
+
+                // verify each buffer
+                for buf in bufs {
+                    assert_eq!(buf, DATA, "data mismatch in pwritev/preadv cycle");
+                }
+
+                assert!(file.close(MID).check_ok());
+            }
+        }
+
+        #[test]
         fn pwrite_pread_cycle_across_sessions() {
             let (_dir, tmp, file) = new_tmp();
 
