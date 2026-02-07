@@ -1,10 +1,9 @@
 use crate::error::{new_error, FFErr};
-use fe::{FErr, FRes};
+use fe::FRes;
 use libc::{
-    c_int, c_short, c_void, close, fcntl, fdatasync, flock, fstat, ftruncate, iovec, off_t, open, pread, preadv,
-    pwrite, pwritev, size_t, stat, sysconf, unlink, EACCES, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE,
-    ENOSPC, EPERM, EROFS, ESPIPE, F_SETLKW, F_UNLCK, F_WRLCK, O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, SEEK_SET,
-    S_IRUSR, S_IWUSR, _SC_IOV_MAX,
+    c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, pread, preadv, pwrite, pwritev, size_t,
+    stat, sysconf, unlink, EACCES, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOSPC, EPERM, EROFS, ESPIPE,
+    O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR, _SC_IOV_MAX,
 };
 use std::{
     ffi::CString,
@@ -95,7 +94,7 @@ impl File {
                 if error_raw == Some(EIO) {
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        std::hint::spin_loop();
+                        std::thread::yield_now();
                         continue;
                     }
 
@@ -117,7 +116,7 @@ impl File {
     #[inline(always)]
     pub(crate) unsafe fn close(&self, mid: u8) -> FRes<()> {
         // prevent multiple close syscalls
-        let fd = self.fd();
+        let fd = self.0.swap(CLOSED_FD, Ordering::AcqRel);
         if fd == CLOSED_FD {
             return Ok(());
         }
@@ -139,7 +138,6 @@ impl File {
             return new_error(mid, FFErr::Unk, error);
         }
 
-        self.close_fd();
         Ok(())
     }
 
@@ -157,9 +155,9 @@ impl File {
         Ok(())
     }
 
-    /// Fetches matadata for [`File`] using `fstat` syscall
+    /// Fetches current length of [`File`] using `fstat` syscall
     #[inline]
-    pub(crate) unsafe fn metadata(&self, mid: u8) -> FRes<stat> {
+    pub(crate) unsafe fn length(&self, mid: u8) -> FRes<u64> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
 
@@ -178,9 +176,10 @@ impl File {
             return new_error(mid, FFErr::Unk, error);
         }
 
-        Ok(st)
+        Ok(st.st_size as u64)
     }
 
+    /// Resize [`File`] w/ `new_len`
     pub(crate) unsafe fn resize(&self, new_len: u64, mid: u8) -> FRes<()> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
@@ -272,11 +271,9 @@ impl File {
         {
             debug_assert_ne!(buffer_size, 0, "invalid buffer length");
             debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
-            debug_assert!(buf_ptrs.len() <= self.max_iovecs(), "Buffer overflow beyound IOV_MAX");
         }
 
-        let nptrs = buf_ptrs.len();
-        let total_len = nptrs * buffer_size;
+        let mut consumed = 0usize;
         let mut iovecs: Vec<iovec> = buf_ptrs
             .iter()
             .map(|ptr| iovec {
@@ -285,13 +282,12 @@ impl File {
             })
             .collect();
 
-        let mut read = 0usize;
-        while read < total_len {
+        while !iovecs.is_empty() {
             let res = preadv(
                 self.fd(),
                 iovecs.as_ptr(),
                 iovecs.len() as c_int,
-                (offset + read) as off_t,
+                offset as off_t + consumed as off_t,
             );
 
             if res <= 0 {
@@ -335,25 +331,21 @@ impl File {
             // Even though this behavior is situation or filesystem dependent (according to my short research),
             // we opt to handle it for correctness across different systems
 
-            let mut idx = 0;
             let mut remaining = res as usize;
 
             while remaining > 0 {
-                let current_iov = &mut iovecs[idx];
-                if remaining >= current_iov.iov_len {
-                    read += current_iov.iov_len;
-                    remaining -= current_iov.iov_len;
-                    idx += 1;
+                let iov = &mut iovecs[0];
+
+                if remaining >= iov.iov_len {
+                    remaining -= iov.iov_len;
+                    consumed += iov.iov_len;
+                    iovecs.remove(0);
                 } else {
-                    current_iov.iov_base = (current_iov.iov_base as *mut u8).add(remaining) as *mut c_void;
-                    current_iov.iov_len -= remaining;
-                    read += remaining;
+                    iov.iov_base = (iov.iov_base as *mut u8).add(remaining) as *mut c_void;
+                    iov.iov_len -= remaining;
+                    consumed += remaining;
                     remaining = 0;
                 }
-            }
-
-            if idx > 0 {
-                iovecs.drain(0..idx);
             }
         }
 
@@ -428,11 +420,10 @@ impl File {
         {
             debug_assert_ne!(buffer_size, 0, "invalid buffer length");
             debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
-            debug_assert!(buf_ptrs.len() <= self.max_iovecs(), "Buffer overflow beyound IOV_MAX");
         }
 
-        let nptrs = buf_ptrs.len();
-        let total_len = nptrs * buffer_size;
+        let mut consumed = 0usize;
+
         let mut iovecs: Vec<iovec> = buf_ptrs
             .iter()
             .map(|ptr| iovec {
@@ -441,13 +432,12 @@ impl File {
             })
             .collect();
 
-        let mut written = 0usize;
-        while written < total_len {
+        while !iovecs.is_empty() {
             let res = pwritev(
                 self.fd(),
                 iovecs.as_ptr(),
                 iovecs.len() as c_int,
-                (offset + written) as off_t,
+                offset as off_t + consumed as off_t,
             );
 
             if res <= 0 {
@@ -496,76 +486,25 @@ impl File {
             // Even though this behavior is situation or filesystem dependent (according to my short research),
             // we opt to handle it for correctness across different systems
 
-            let mut idx = 0;
             let mut remaining = res as usize;
 
             while remaining > 0 {
-                let current_iov = &mut iovecs[idx];
-                if remaining >= current_iov.iov_len {
-                    idx += 1;
-                    written += current_iov.iov_len;
-                    remaining -= current_iov.iov_len;
+                let iov = &mut iovecs[0];
+
+                if remaining >= iov.iov_len {
+                    remaining -= iov.iov_len;
+                    consumed += iov.iov_len;
+                    iovecs.remove(0);
                 } else {
-                    current_iov.iov_base = (current_iov.iov_base as *mut u8).add(remaining) as *mut c_void;
-                    current_iov.iov_len -= remaining;
-                    written += remaining;
+                    iov.iov_base = (iov.iov_base as *mut u8).add(remaining) as *mut c_void;
+                    iov.iov_len -= remaining;
+                    consumed += remaining;
                     remaining = 0;
                 }
-            }
-
-            if idx > 0 {
-                iovecs.drain(0..idx);
             }
         }
 
         Ok(())
-    }
-
-    /// Acquire an exclusive write lock to [`File`]
-    #[inline]
-    pub(super) unsafe fn lock(&self, mid: u8) -> FRes<()> {
-        // sanity check
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
-        self.flock_impl(F_WRLCK, mid)
-    }
-
-    /// Release the acquired lock (shared/exclusive) for [`File`]
-    #[inline]
-    pub(super) unsafe fn unlock(&self, mid: u8) -> FRes<()> {
-        // sanity check
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
-        self.flock_impl(F_UNLCK, mid)
-    }
-
-    #[inline]
-    unsafe fn flock_impl(&self, lock_type: c_int, mid: u8) -> FRes<()> {
-        let mut fl = flock {
-            l_type: lock_type as c_short,
-            l_whence: SEEK_SET as c_short,
-            l_start: 0,
-            l_len: 0, // whole file
-            l_pid: 0,
-        };
-
-        loop {
-            if fcntl(self.fd(), F_SETLKW, &mut fl) != 0 {
-                let error = io::Error::last_os_error();
-
-                // We must retry on interuption errors, e.g. EINTR
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-
-                return new_error(mid, FFErr::Lck, error);
-            }
-
-            return Ok(());
-        }
-    }
-
-    #[inline]
-    fn close_fd(&self) {
-        self.0.store(CLOSED_FD, Ordering::Release);
     }
 }
 
@@ -654,7 +593,7 @@ fn path_to_cstring(path: &std::path::PathBuf, mid: u8) -> FRes<CString> {
         Ok(cs) => Ok(cs),
         Err(e) => {
             let error = io::Error::new(io::ErrorKind::Other, e.to_string());
-            new_error(mid, FFErr::Inv, e.into())
+            new_error(mid, FFErr::Inv, error)
         }
     }
 }
@@ -766,7 +705,7 @@ mod tests {
 
         #[test]
         fn sync_works() {
-            let (_dir, tmp, file) = new_tmp();
+            let (_dir, _tmp, file) = new_tmp();
 
             unsafe {
                 assert!(file.sync(MID).check_ok());
@@ -815,8 +754,8 @@ mod tests {
             unsafe {
                 assert!(file.resize(NEW_LEN, MID).check_ok());
 
-                let curr_len = file.metadata(MID).expect("fetch metadata").st_size;
-                assert_eq!(curr_len, NEW_LEN as i64);
+                let curr_len = file.length(MID).expect("fetch metadata");
+                assert_eq!(curr_len, NEW_LEN);
                 assert!(file.close(MID).check_ok());
             }
 
@@ -837,8 +776,8 @@ mod tests {
             unsafe {
                 assert!(file.resize(NEW_LEN, MID).check_ok());
 
-                let curr_len = file.metadata(MID).expect("fetch metadata").st_size;
-                assert_eq!(curr_len, NEW_LEN as i64);
+                let curr_len = file.length(MID).expect("fetch metadata");
+                assert_eq!(curr_len, NEW_LEN);
 
                 assert!(file.sync(MID).check_ok());
                 assert!(file.close(MID).check_ok());
@@ -846,45 +785,10 @@ mod tests {
                 match File::new(&tmp, false, MID) {
                     Err(e) => panic!("{:?}", e),
                     Ok(file) => {
-                        let curr_len = file.metadata(MID).expect("fetch metadata").st_size;
-                        assert_eq!(curr_len, NEW_LEN as i64);
+                        let curr_len = file.length(MID).expect("fetch metadata");
+                        assert_eq!(curr_len, NEW_LEN);
                     }
                 }
-            }
-        }
-    }
-
-    mod lock_unlock {
-        use super::*;
-
-        #[test]
-        fn lock_unlock_cycle() {
-            let (_dir, tmp, file) = new_tmp();
-
-            unsafe {
-                assert!(file.lock(MID).check_ok());
-                assert!(file.unlock(MID).check_ok());
-
-                assert!(file.lock(MID).check_ok());
-                assert!(file.unlock(MID).check_ok());
-
-                assert!(file.close(MID).check_ok());
-            }
-        }
-
-        #[test]
-        fn lock_survives_io_operation() {
-            let (_dir, tmp, file) = new_tmp();
-
-            unsafe {
-                assert!(file.lock(MID).check_ok());
-
-                let data = vec![1u8; 0x20];
-                file.resize(data.len() as u64, MID).expect("resize file");
-                file.pwrite(data.as_ptr(), 0, data.len(), MID).expect("write to file");
-
-                assert!(file.unlock(MID).check_ok());
-                assert!(file.close(MID).check_ok());
             }
         }
     }
@@ -894,7 +798,7 @@ mod tests {
 
         #[test]
         fn pwrite_pread_cycle() {
-            let (_dir, tmp, file) = new_tmp();
+            let (_dir, _tmp, file) = new_tmp();
 
             const LEN: usize = 0x20;
             const DATA: [u8; LEN] = [0x1A; LEN];
@@ -912,7 +816,7 @@ mod tests {
 
         #[test]
         fn pwritev_pread_cycle() {
-            let (_dir, tmp, file) = new_tmp();
+            let (_dir, _tmp, file) = new_tmp();
 
             const LEN: usize = 0x20;
             const DATA: [u8; LEN] = [0x1A; LEN];
@@ -941,7 +845,7 @@ mod tests {
 
         #[test]
         fn pwritev_preadv_cycle() {
-            let (_dir, tmp, file) = new_tmp();
+            let (_dir, _tmp, file) = new_tmp();
 
             const LEN: usize = 0x20;
             const DATA: [u8; LEN] = [0x1A; LEN];
@@ -955,7 +859,7 @@ mod tests {
 
                 // prepare read buffers
                 let mut bufs: Vec<Vec<u8>> = (0..ptrs.len()).map(|_| vec![0u8; LEN]).collect();
-                let mut buf_ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+                let buf_ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
 
                 assert!(file.preadv(&buf_ptrs, 0, LEN, MID).check_ok(), "preadv failed");
 
@@ -1038,36 +942,6 @@ mod tests {
             for i in 0..THREADS {
                 let chunk = &read_buf[i * CHUNK..(i + 1) * CHUNK];
                 assert!(chunk.iter().all(|b| *b == i as u8));
-            }
-        }
-
-        #[test]
-        fn concurrent_writes_with_lock() {
-            const THREADS: usize = 4;
-            const LEN: usize = 0x80;
-
-            let (_dir, _tmp, file) = new_tmp();
-            let file = std::sync::Arc::new(file);
-
-            unsafe { file.resize(LEN as u64, MID).expect("extend") };
-
-            let mut handles = Vec::new();
-            for _ in 0..THREADS {
-                let f = file.clone();
-                handles.push(std::thread::spawn(move || unsafe {
-                    let _guard = f.lock(MID).expect("lock");
-                    let data = vec![0xAB; LEN];
-                    assert!(f.pwrite(data.as_ptr(), 0, LEN, MID).check_ok());
-                }));
-            }
-
-            for h in handles {
-                assert!(h
-                    .join()
-                    .map_err(|e| {
-                        eprintln!("\n{:?}\n", e);
-                    })
-                    .is_ok());
             }
         }
     }
