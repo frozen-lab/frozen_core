@@ -1,16 +1,17 @@
+//! Custom implementation of File
+
 #![deny(missing_docs)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-//! Custom implementation of File
-
-mod error;
 #[cfg(target_os = "linux")]
 mod linux;
 
+mod error;
 pub use error::FFErr;
 
 use error::{new_error, raw_err_with_msg, raw_error};
 use fe::{FErr, FRes};
+use hints::unlikely;
 use std::{cell, mem, sync, sync::atomic, thread};
 
 #[cfg(target_os = "linux")]
@@ -51,9 +52,8 @@ impl FF {
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::File::new(&cfg.path, true, cfg.module_id) }?;
         let init_res = unsafe { file.resize(length, cfg.module_id) };
-        let max_iovecs = unsafe { file.max_iovecs() };
 
-        let core = sync::Arc::new(Core::new(file, cfg.clone(), length, max_iovecs));
+        let core = sync::Arc::new(Core::new(file, cfg.clone(), length));
         let ff = Self(core.clone());
 
         if let Err(e) = init_res {
@@ -77,11 +77,9 @@ impl FF {
 
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::File::new(&cfg.path, false, cfg.module_id) }?;
-
         let length = unsafe { file.length(cfg.module_id) }?;
-        let max_iovecs = unsafe { file.max_iovecs() };
 
-        let core = sync::Arc::new(Core::new(file, cfg.clone(), length, max_iovecs));
+        let core = sync::Arc::new(Core::new(file, cfg.clone(), length));
         let ff = Self(core.clone());
 
         if cfg.auto_flush {
@@ -94,7 +92,7 @@ impl FF {
     /// Resize [`FF`] w/ `new_len`
     pub fn resize(&self, new_len: u64) -> FRes<()> {
         // sanity checks
-        self.sanity_check()?;
+        self.ensure_sanity()?;
         debug_assert!(new_len > self.length());
 
         #[cfg(not(target_os = "linux"))]
@@ -124,7 +122,7 @@ impl FF {
     #[inline]
     pub fn sync(&self) -> FRes<()> {
         // sanity check
-        self.sanity_check()?;
+        self.ensure_sanity()?;
         self.0.sync()
     }
 
@@ -167,7 +165,7 @@ impl FF {
     #[inline]
     pub fn read(&self, buf_ptr: *mut u8, offset: usize, len_to_read: usize) -> FRes<()> {
         // sanity check
-        self.sanity_check()?;
+        self.ensure_sanity()?;
 
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
@@ -183,7 +181,7 @@ impl FF {
     #[inline]
     pub fn readv(&self, buf_ptrs: &[*mut u8], offset: usize, len_to_read: usize) -> FRes<()> {
         // sanity checks
-        self.sanity_check()?;
+        self.ensure_sanity()?;
         debug_assert!(buf_ptrs.len() <= self.0.max_iovecs);
 
         #[cfg(not(target_os = "linux"))]
@@ -200,7 +198,7 @@ impl FF {
     #[inline]
     pub fn write(&self, buf_ptr: *const u8, offset: usize, len_to_write: usize) -> FRes<()> {
         // sanity check
-        self.sanity_check()?;
+        self.ensure_sanity()?;
         debug_assert!(offset + len_to_write <= self.length() as usize);
 
         #[cfg(not(target_os = "linux"))]
@@ -221,7 +219,7 @@ impl FF {
     #[inline]
     pub fn writev(&self, buf_ptrs: &[*const u8], offset: usize, buffer_size: usize) -> FRes<()> {
         // sanity check
-        self.sanity_check()?;
+        self.ensure_sanity()?;
         debug_assert!(buf_ptrs.len() <= self.0.max_iovecs);
         debug_assert!(offset + (buf_ptrs.len() * buffer_size) <= self.length() as usize);
 
@@ -240,12 +238,13 @@ impl FF {
     }
 
     #[inline(always)]
-    fn sanity_check(&self) -> FRes<()> {
+    fn ensure_sanity(&self) -> FRes<()> {
         if let Some(err) = self.0.error.get() {
             return Err(err.clone());
         }
 
-        if self.0.closed.load(atomic::Ordering::Acquire) {
+        let closed = self.0.closed.load(atomic::Ordering::Acquire);
+        if unlikely(closed) {
             let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Trying to access closed FF");
             return new_error(self.0.cfg.module_id, FFErr::Hcf, error);
         }
@@ -270,9 +269,8 @@ impl Drop for FF {
             self.0.cv.notify_one();
         }
 
-        // sync if dirty
+        // sync if dirty & close
         let _ = self.0.sync();
-
         let _ = unsafe { self.get_file().close(self.0.cfg.module_id) };
     }
 }
@@ -311,13 +309,13 @@ unsafe impl Send for Core {}
 unsafe impl Sync for Core {}
 
 impl Core {
-    fn new(file: FFile, cfg: FFCfg, length: u64, max_iovecs: usize) -> Self {
+    fn new(file: FFile, cfg: FFCfg, length: u64) -> Self {
         Self {
             cfg,
-            max_iovecs,
             cv: sync::Condvar::new(),
             lock: sync::Mutex::new(()),
             error: sync::OnceLock::new(),
+            max_iovecs: get_max_iovecs(),
             dirty: atomic::AtomicBool::new(false),
             closed: atomic::AtomicBool::new(false),
             length: atomic::AtomicU64::new(length),
@@ -424,6 +422,24 @@ impl Core {
             }
         }
     }
+}
+
+/// max iovecs allowed for single readv/writev calls
+const MAX_IOVECS: usize = 512;
+
+fn get_max_iovecs() -> usize {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let res = libc::sysconf(libc::_SC_IOV_MAX);
+        if res <= 0 {
+            return MAX_IOVECS;
+        }
+
+        return res as usize;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    MAX_IOVECS
 }
 
 #[cfg(all(test, target_os = "linux"))]

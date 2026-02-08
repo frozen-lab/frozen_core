@@ -39,6 +39,7 @@ name = "ff"
 version = "0.1.0"
 dependencies = [
  "fe",
+ "hints",
  "libc",
  "tempfile",
 ]
@@ -64,6 +65,10 @@ dependencies = [
  "r-efi",
  "wasip2",
 ]
+
+[[package]]
+name = "hints"
+version = "0.1.0"
 
 [[package]]
 name = "libc"

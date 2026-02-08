@@ -2,8 +2,8 @@ use crate::error::{new_error, FFErr};
 use fe::FRes;
 use libc::{
     c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, pread, preadv, pwrite, pwritev, size_t,
-    stat, sysconf, unlink, EACCES, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOSPC, EPERM, EROFS, ESPIPE,
-    O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR, _SC_IOV_MAX,
+    stat, unlink, EACCES, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOSPC, EPERM, EROFS, ESPIPE,
+    O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
 };
 use std::{
     ffi::CString,
@@ -14,7 +14,6 @@ use std::{
 };
 
 const CLOSED_FD: i32 = -1;
-const MAX_IOVECS: usize = 512;
 
 /// Linux implementation of `File`
 pub(crate) struct File(AtomicI32);
@@ -33,18 +32,6 @@ impl File {
     #[inline]
     pub(crate) fn fd(&self) -> i32 {
         self.0.load(Ordering::Acquire)
-    }
-
-    /// fetch value of maximum iovecs allowed in preadv/pwritev syscalls
-    ///
-    /// **NOTE:** On some systems, `_SC_IOV_MAX` is not set, hence it can return `-1`
-    pub(crate) unsafe fn max_iovecs(&self) -> usize {
-        let res = sysconf(_SC_IOV_MAX);
-        if res <= 0 {
-            return MAX_IOVECS;
-        }
-
-        res as usize
     }
 
     /// Syncs in-mem data on the storage device
