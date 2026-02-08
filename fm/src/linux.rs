@@ -17,10 +17,10 @@ unsafe impl Sync for MMap {}
 
 impl MMap {
     /// Create a new [`MMap`] instance for given `fd` w/ read & write permissions
-    pub(crate) unsafe fn new(fd: i32, len: size_t, mid: u8) -> FRes<Self> {
+    pub(crate) unsafe fn new(fd: i32, length: size_t, mid: u8) -> FRes<Self> {
         let ptr = mmap(
             std::ptr::null_mut(),
-            len,
+            length,
             PROT_WRITE | PROT_READ,
             MAP_SHARED,
             fd,
