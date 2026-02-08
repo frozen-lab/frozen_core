@@ -34,33 +34,21 @@ where
 /// Error codes for [`FM`]
 #[repr(u16)]
 pub enum FMErr {
-    /// (256) internal fuck up
-    Hcf = 0x100,
+    /// (512) internal fuck up
+    Hcf = 0x200,
 
-    /// (257) unknown error (fallback)
-    Unk = 0x101,
+    /// (513) unknown error (fallback)
+    Unk = 0x201,
 
-    /// (258) no more space available
-    Nsp = 0x102,
+    /// (514) no more memory available
+    Nmm = 0x202,
 
-    /// (259) unexpected eof
-    Eof = 0x103,
+    /// (515) syncing error
+    Syn = 0x203,
 
-    /// (260) syncing error
-    Syn = 0x104,
+    /// (516) thread error or panic inside thread
+    Txe = 0x204,
 
-    /// (261) no write perm
-    Wrt = 0x105,
-
-    /// (262) no read perm
-    Red = 0x106,
-
-    /// (263) invalid path
-    Inv = 0x107,
-
-    /// (264) thread error or panic inside thread
-    Txe = 0x108,
-
-    /// (265) lock error (failed or poisoned)
-    Lpn = 0x109,
+    /// (517) lock error (failed or poisoned)
+    Lpn = 0x205,
 }

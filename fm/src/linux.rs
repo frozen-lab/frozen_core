@@ -1,3 +1,4 @@
+use crate::{error::new_error, FMErr};
 use fe::FRes;
 use libc::{
     c_void, mmap, msync, munmap, off_t, size_t, EACCES, EBADF, EBUSY, EINVAL, EIO, ENOMEM, EOVERFLOW, MAP_FAILED,
@@ -5,8 +6,7 @@ use libc::{
 };
 use std::sync::atomic;
 
-use crate::{error::new_error, FMErr};
-
+/// Linux implementation of `MemMap`
 pub(crate) struct MMap {
     ptr: *mut c_void,
     unmapped: atomic::AtomicBool,
@@ -16,7 +16,8 @@ unsafe impl Send for MMap {}
 unsafe impl Sync for MMap {}
 
 impl MMap {
-    pub(super) unsafe fn new(fd: i32, len: size_t, mid: u8) -> FRes<Self> {
+    /// Create a new [`MMap`] instance for given `fd` w/ read & write permissions
+    pub(crate) unsafe fn new(fd: i32, len: size_t, mid: u8) -> FRes<Self> {
         let ptr = mmap(
             std::ptr::null_mut(),
             len,
@@ -41,7 +42,7 @@ impl MMap {
 
             // no more memory space available
             if err_raw == Some(ENOMEM) {
-                return new_error(mid, FMErr::Nsp, error);
+                return new_error(mid, FMErr::Nmm, error);
             }
 
             // unknown (unsupported, etc.)
@@ -54,11 +55,15 @@ impl MMap {
         });
     }
 
+    /// Unmap (free/drop) the mmaped instance of [`MMap`]
     pub(crate) unsafe fn unmap(&self, length: usize, mid: u8) -> FRes<()> {
         // NOTE: To avoid another thread/process from executing munmap, we mark unmapped before even
         // trying to unmap, this kind of wroks like mutex, as we reassign to false on failure
-        let unmapped = self.unmapped.swap(true, atomic::Ordering::AcqRel);
-        if unmapped {
+        if self
+            .unmapped
+            .compare_exchange(false, true, atomic::Ordering::AcqRel, atomic::Ordering::Acquire)
+            .is_err()
+        {
             return Ok(());
         }
 
@@ -78,7 +83,8 @@ impl MMap {
         Ok(())
     }
 
-    pub(super) unsafe fn sync(&self, length: usize, mid: u8) -> FRes<()> {
+    /// Syncs in-mem data on the storage device
+    pub(crate) unsafe fn sync(&self, length: usize, mid: u8) -> FRes<()> {
         // only for EIO and EBUSY errors
         const MAX_RETRIES: usize = 4;
         let mut retries = 0;
@@ -120,6 +126,7 @@ impl MMap {
         }
     }
 
+    /// Get an immutable typed pointer at given `offset`
     #[inline]
     pub(crate) unsafe fn get<T>(&self, offset: usize) -> *const T {
         // sanity check
@@ -132,6 +139,7 @@ impl MMap {
         self.ptr.add(offset) as *const T
     }
 
+    /// Get a mutable (read/write) typed pointer at given `offset`
     #[inline]
     pub(crate) unsafe fn get_mut<T>(&self, offset: usize) -> *mut T {
         // sanity check
