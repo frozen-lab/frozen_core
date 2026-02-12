@@ -23,35 +23,16 @@ frozen-core = { version = "0.0.2", features = ["ff"] }
 
 `FF` is currently available for following platforms,
 
-| Platform                    | Support |
-| --------------------------- |:-------:|
-| `x86_64-unknown-linux-gnu`  | ✅      |
-| `aarch64-unknown-linux-gnu` | ✅      |
-| `x86_64-apple-darwin`       | ❌      |
-| `aarch64-apple-darwin`      | ❌      |
-| `x86_64-pc-windows-msvc`    | ❌      |
+| Platform                              | Support |
+|---------------------------------------|:-------:|
+| `aarch64-unknown-linux-gnu`           | ✅      |
+| `x86_64-unknown-linux-gnu`            | ✅      |
+| `aarch64-pc-windows-msvc`             | ❌      |
+| `x86_64-pc-windows-msvc`              | ❌      |
+| `aarch64-apple-darwin`                | ❌      |
+| `x86_64-apple-darwin`                 | ❌      |
 
-Example usage,
-
-```rs
-use frozen_core::ff::{FF, FFCfg};
-
-const MODULE_ID: u8 = 1;
-
-fn main() {
-    let path = "/tmp/example/data.bin".into();
-    let ff = FF::new(FFCfg::new(path, MODULE_ID), 16).expect("create");
-
-    let data = 42u64.to_le_bytes();
-    ff.write(data.as_ptr(), 0, data.len()).expect("write");
-    ff.sync().expect("sync");
-
-    let mut buf = [0u8; 8];
-    ff.read(buf.as_mut_ptr(), 0, buf.len()).expect("read");
-
-    assert_eq!(u64::from_le_bytes(buf), 42);
-}
-```
+For Example usage, refer to [example](./examples/ff_example.rs)
 
 ## FrozenMMap
 
@@ -66,40 +47,16 @@ frozen-core = { version = "0.0.2", features = ["fm"] }
 
 `FM` is currently available for following platforms,
 
-| Platform                    | Support |
-| --------------------------- |:-------:|
-| `x86_64-unknown-linux-gnu`  | ✅      |
-| `aarch64-unknown-linux-gnu` | ✅      |
-| `x86_64-apple-darwin`       | ❌      |
-| `aarch64-apple-darwin`      | ❌      |
-| `x86_64-pc-windows-msvc`    | ❌      |
+| Platform                              | Support |
+|---------------------------------------|:-------:|
+| `aarch64-unknown-linux-gnu`           | ✅      |
+| `x86_64-unknown-linux-gnu`            | ✅      |
+| `aarch64-pc-windows-msvc`             | ❌      |
+| `x86_64-pc-windows-msvc`              | ❌      |
+| `aarch64-apple-darwin`                | ❌      |
+| `x86_64-apple-darwin`                 | ❌      |
 
-Example usage,
-
-```rs
-use frozen_core::fm::{FM, FMCfg};
-use frozen_core::ff::{FF, FFCfg};
-
-const MODULE_ID: u8 = 1;
-
-fn main() {
-    let path = "/tmp/example/data.bin".into();
-    let ff = FF::new(FFCfg::new(path, MODULE_ID), 8).expect("file");
-    let fm = FM::new(ff.fd(), 8, FMCfg::new(MODULE_ID)).expect("mmap");
-
-    {
-        let w = fm.writer::<u64>(0).expect("writer");
-        w.write(|v| *v = 0xDEADBEEF).expect("write");
-    }
-
-    fm.sync().expect("sync");
-
-    let r = fm.reader::<u64>(0).expect("reader");
-    let value = r.read(|v| *v);
-
-    assert_eq!(value, 0xDEADBEEF);
-}
-```
+For Example usage, refer to [example](./examples/fm_example.rs)
 
 ## FrozenError
 
@@ -121,40 +78,6 @@ The `hints` module is available by deafult. Add it as a dependency in your `Carg
 ```toml
 [dependencies]
 frozen-core = "0.0.2"
-```
-
-Example usage,
-
-```rs
-use frozen_core::hints::{likely, unlikely};
-
-fn main() {
-    let enabled = true;
-    let values = [1, 2, 3, -1, 4];
-
-    // Hot configuration path
-    if likely(enabled) {
-        fast_path();
-    }
-
-    // Hot loop with rare error case
-    for v in values {
-        if unlikely(v < 0) {
-            continue; // rare invalid value
-        }
-        process(v);
-    }
-}
-
-#[inline]
-fn fast_path() {
-    // expected fast path
-}
-
-#[inline]
-fn process(_v: i32) {
-    // normal processing
-}
 ```
 
 ## Notes

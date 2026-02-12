@@ -547,6 +547,7 @@ where
     FErr::with_msg(code, format!("{msg} due to error =>\n{error}"))
 }
 
+#[cfg(test)]
 mod ff_tests {
     use super::*;
     use crate::fe::{FECheckOk, MID};

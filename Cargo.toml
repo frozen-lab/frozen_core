@@ -20,3 +20,11 @@ tempfile = "3.20.0"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2.178"
+
+[[example]]
+name = "ff_example"
+required-features = ["ff"]
+
+[[example]]
+name = "fm_example"
+required-features = ["ff", "fm"]
