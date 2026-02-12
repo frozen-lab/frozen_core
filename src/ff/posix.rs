@@ -15,20 +15,20 @@ use std::{
 
 const CLOSED_FD: i32 = -1;
 
-/// Linux implementation of `File`
-pub(crate) struct File(AtomicI32);
+/// Linux implementation of `PosixFile`
+pub(crate) struct PosixFile(AtomicI32);
 
-unsafe impl Send for File {}
-unsafe impl Sync for File {}
+unsafe impl Send for PosixFile {}
+unsafe impl Sync for PosixFile {}
 
-impl File {
-    /// creates/opens a new instance of [`File`]
+impl PosixFile {
+    /// creates/opens a new instance of [`PosixFile`]
     pub(crate) unsafe fn new(path: &PathBuf, is_new: bool, mid: u8) -> FRes<Self> {
         let fd = open_with_flags(path, prep_flags(is_new), mid)?;
         Ok(Self(AtomicI32::new(fd)))
     }
 
-    /// Get file descriptor for [`File`]
+    /// Get file descriptor for [`PosixFile`]
     #[inline]
     pub(crate) fn fd(&self) -> i32 {
         self.0.load(Ordering::Acquire)
@@ -47,7 +47,7 @@ impl File {
     #[inline]
     pub(super) unsafe fn sync(&self, mid: u8) -> FRes<()> {
         // sanity check
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
+        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
 
         // only for EIO errors
         const MAX_RETRIES: usize = 4;
@@ -97,7 +97,7 @@ impl File {
         }
     }
 
-    /// Closes file handle for [`File`]
+    /// Closes file handle for [`PosixFile`]
     ///
     /// This function is _idempotent_ and prevents close-on-close errors!
     #[inline(always)]
@@ -128,9 +128,9 @@ impl File {
         Ok(())
     }
 
-    /// Unlinks (possibly deletes) the [`File`]
+    /// Unlinks (possibly deletes) the [`PosixFile`]
     ///
-    /// **WARN**: File must be closed beforehand, to avoid I/O errors
+    /// **WARN**: PosixFile must be closed beforehand, to avoid I/O errors
     #[inline]
     pub(super) unsafe fn unlink(&self, path: &PathBuf, mid: u8) -> FRes<()> {
         let cpath = path_to_cstring(path, mid)?;
@@ -142,11 +142,11 @@ impl File {
         Ok(())
     }
 
-    /// Fetches current length of [`File`] using `fstat` syscall
+    /// Fetches current length of [`PosixFile`] using `fstat` syscall
     #[inline]
     pub(crate) unsafe fn length(&self, mid: u8) -> FRes<u64> {
         // sanity check
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
+        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
 
         let mut st = std::mem::zeroed::<stat>();
         let res = fstat(self.fd(), &mut st);
@@ -166,10 +166,10 @@ impl File {
         Ok(st.st_size as u64)
     }
 
-    /// Resize [`File`] w/ `new_len`
+    /// Resize [`PosixFile`] w/ `new_len`
     pub(crate) unsafe fn resize(&self, new_len: u64, mid: u8) -> FRes<()> {
         // sanity check
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
+        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
 
         if ftruncate(self.fd(), new_len as off_t) != 0 {
             let error = last_os_error();
@@ -196,13 +196,13 @@ impl File {
         Ok(())
     }
 
-    /// Read (multiple vectors) at given `offset` w/ `preadv` syscall from [`File`]
+    /// Read (multiple vectors) at given `offset` w/ `preadv` syscall from [`PosixFile`]
     #[inline(always)]
     pub(super) unsafe fn preadv(&self, iovecs: &mut [iovec], offset: usize, mid: u8) -> FRes<()> {
         // sanity checks
         #[cfg(debug_assertions)]
         {
-            debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
+            debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
             debug_assert_ne!(iovecs.len(), 0, "iovecs must not be empty");
 
             let iov_len = iovecs[0].iov_len;
@@ -283,14 +283,14 @@ impl File {
         Ok(())
     }
 
-    /// Read at given `offset` w/ `pread` syscall from [`File`]
+    /// Read at given `offset` w/ `pread` syscall from [`PosixFile`]
     #[inline(always)]
     #[allow(unused)]
     unsafe fn pread(&self, buf_ptr: *mut u8, offset: usize, len_to_read: usize, mid: u8) -> FRes<()> {
         // sanity checks
         debug_assert_ne!(len_to_read, 0, "invalid length");
         debug_assert!(!buf_ptr.is_null(), "invalid buffer pointer");
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
+        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
 
         let mut read = 0usize;
         while read < len_to_read {
@@ -338,13 +338,13 @@ impl File {
         Ok(())
     }
 
-    /// Write (multiple vectors) at given `offset` w/ `pwritev` syscall to [`File`]
+    /// Write (multiple vectors) at given `offset` w/ `pwritev` syscall to [`PosixFile`]
     #[inline(always)]
     pub(super) unsafe fn pwritev(&self, iovecs: &mut [iovec], offset: usize, mid: u8) -> FRes<()> {
         // sanity checks
         #[cfg(debug_assertions)]
         {
-            debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
+            debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
             debug_assert_ne!(iovecs.len(), 0, "iovecs must not be empty");
 
             let iov_len = iovecs[0].iov_len;
@@ -430,14 +430,14 @@ impl File {
         Ok(())
     }
 
-    /// Write at given `offset` w/ `pwrite` syscall to [`File`]
+    /// Write at given `offset` w/ `pwrite` syscall to [`PosixFile`]
     #[inline(always)]
     #[allow(unused)]
     unsafe fn pwrite(&self, buf_ptr: *const u8, offset: usize, len_to_write: usize, mid: u8) -> FRes<()> {
         // sanity checks
         debug_assert_ne!(len_to_write, 0, "invalid length");
         debug_assert!(!buf_ptr.is_null(), "invalid buffer pointer");
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxFile");
+        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
 
         let mut written = 0usize;
         while written < len_to_write {
@@ -549,7 +549,7 @@ unsafe fn open_with_flags(path: &PathBuf, mut flags: i32, mid: u8) -> FRes<i32> 
 ///
 /// ## Access Time Updates (O_NOATIME)
 ///
-/// We use the `O_NOATIME` flag to disable access time updates on the [`File`]
+/// We use the `O_NOATIME` flag to disable access time updates on the [`PosixFile`]
 /// Normally every I/O operation triggers an `atime` update/write to disk
 ///
 /// This is counter productive and increases latency for I/O ops in our case!
@@ -588,10 +588,10 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::{tempdir, TempDir};
 
-    fn new_tmp() -> (TempDir, PathBuf, File) {
+    fn new_tmp() -> (TempDir, PathBuf, PosixFile) {
         let dir = tempdir().expect("temp dir");
         let tmp = dir.path().join("tmp_file");
-        let file = unsafe { File::new(&tmp, true, MID) }.expect("new LinuxFile");
+        let file = unsafe { PosixFile::new(&tmp, true, MID) }.expect("new LinuxPosixFile");
 
         (dir, tmp, file)
     }
@@ -616,7 +616,7 @@ mod tests {
                 assert!(file.fd() >= 0);
                 assert!(file.close(MID).check_ok());
 
-                match File::new(&tmp, false, MID) {
+                match PosixFile::new(&tmp, false, MID) {
                     Ok(file) => {
                         assert!(file.fd() >= 0);
                         assert!(file.close(MID).check_ok());
@@ -635,7 +635,7 @@ mod tests {
                 assert!(file.close(MID).check_ok());
                 assert!(file.unlink(&tmp, MID).check_ok());
 
-                let file = File::new(&tmp, false, MID);
+                let file = PosixFile::new(&tmp, false, MID);
                 assert!(file.is_err());
             }
         }
@@ -757,7 +757,7 @@ mod tests {
                 assert!(file.sync(MID).check_ok());
                 assert!(file.close(MID).check_ok());
 
-                match File::new(&tmp, false, MID) {
+                match PosixFile::new(&tmp, false, MID) {
                     Err(e) => panic!("{:?}", e),
                     Ok(file) => {
                         let curr_len = file.length(MID).expect("fetch metadata");
@@ -886,7 +886,7 @@ mod tests {
             // open + read + verify
             unsafe {
                 let mut buf = vec![0u8; LEN];
-                let file = File::new(&tmp, false, MID).expect("open file");
+                let file = PosixFile::new(&tmp, false, MID).expect("open file");
 
                 assert!(file.pread(buf.as_mut_ptr(), 0, LEN, MID).check_ok());
                 assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");

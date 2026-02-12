@@ -1,7 +1,7 @@
 //! Custom implementation of File
 
-#[cfg(target_os = "linux")]
-mod linux;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod posix;
 
 use crate::fe::{FErr, FRes};
 use crate::hints::unlikely;
@@ -21,7 +21,7 @@ const AUTO_FLUSH: bool = false;
 const FLUSH_DURATION: time::Duration = time::Duration::from_millis(250);
 
 #[cfg(target_os = "linux")]
-type FFile = linux::File;
+type FFile = posix::PosixFile;
 
 #[cfg(not(target_os = "linux"))]
 type FFile = ();
@@ -120,7 +120,7 @@ impl FF {
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        let file = unsafe { linux::File::new(&cfg.path, true, cfg.module_id) }?;
+        let file = unsafe { posix::PosixFile::new(&cfg.path, true, cfg.module_id) }?;
         let init_res = unsafe { file.resize(length, cfg.module_id) };
 
         let core = sync::Arc::new(Core::new(file, cfg.clone(), length));
@@ -146,7 +146,7 @@ impl FF {
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        let file = unsafe { linux::File::new(&cfg.path, false, cfg.module_id) }?;
+        let file = unsafe { posix::PosixFile::new(&cfg.path, false, cfg.module_id) }?;
         let length = unsafe { file.length(cfg.module_id) }?;
 
         let core = sync::Arc::new(Core::new(file, cfg.clone(), length));
@@ -239,8 +239,8 @@ impl FF {
     }
 
     /// Read (multiple vectors) at given `offset` from [`FF`]
-    #[cfg(target_os = "linux")]
     #[inline(always)]
+    #[cfg(target_os = "linux")]
     pub fn readv(&self, iovecs: &mut [libc::iovec], offset: usize) -> FRes<()> {
         // sanity checks
         self.ensure_sanity()?;
@@ -256,7 +256,8 @@ impl FF {
     }
 
     /// Write (multiple vectors) at given `offset` to [`FF`]
-    #[inline]
+    #[inline(always)]
+    #[cfg(target_os = "linux")]
     pub fn writev(&self, iovecs: &mut [libc::iovec], offset: usize) -> FRes<()> {
         // sanity check
         self.ensure_sanity()?;
