@@ -6,6 +6,14 @@
 const fn cold_fn() {}
 
 /// Branch predictor hint, which marks given condition as *likely* to be
+///
+/// # Example
+///
+/// ```
+/// use frozen_core::hints::likely;
+/// assert!(likely(true));
+/// assert!(!likely(false));
+/// ```
 #[inline]
 pub const fn likely(b: bool) -> bool {
     if !b {
@@ -15,6 +23,14 @@ pub const fn likely(b: bool) -> bool {
 }
 
 /// Branch predictor hint, which marks given condition as *unlikely* to be
+///
+/// # Example
+///
+/// ```
+/// use frozen_core::hints::unlikely;
+/// assert!(unlikely(true));
+/// assert!(!unlikely(false));
+/// ```
 #[inline]
 pub const fn unlikely(b: bool) -> bool {
     if b {
