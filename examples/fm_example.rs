@@ -7,7 +7,7 @@ const MODULE_ID: u8 = 0;
 
 fn main() {
     let dir = std::path::PathBuf::from("/tmp/frozen-core/examples");
-    let path = dir.join("ff_example.bin");
+    let path = dir.join("fm_example.bin");
     std::fs::create_dir_all(&dir).expect("create example dir");
 
     let ff = FF::new(FFCfg::new(path, MODULE_ID), 8).expect("file");

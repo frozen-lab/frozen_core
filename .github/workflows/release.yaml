@@ -10,7 +10,38 @@ permissions:
   id-token: write
 
 jobs:
+  examples:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: examples-${{ matrix.platform.arch }}
+          cache-on-failure: true
+
+      - name: Run ff example
+        run: cargo run --release --example ff_example --features ff
+
+      - name: Run fm example
+        run: cargo run --release --example fm_example --features fm
+
   release:
+    needs: examples
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

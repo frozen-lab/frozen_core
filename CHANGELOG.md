@@ -1,5 +1,10 @@
 # Changelog
 
+## `0.0.3`
+
+- Improved `docs`
+- Added `examples/`
+
 ## `0.0.2`
 
 - Improved `FFCfg` & `FMCfg` w/ builder pattern construction

@@ -1,7 +1,7 @@
 [package]
 name = "frozen-core"
 edition = "2024"
-version = "0.0.2"
+version = "0.0.3"
 exclude = ["shell.nix"]
 license = "MIT OR Apache-2.0"
 keywords = ["frozen-lab", "frozen-core"]
