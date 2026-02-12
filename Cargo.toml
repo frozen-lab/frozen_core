@@ -4,7 +4,7 @@ edition = "2024"
 version = "0.0.2"
 exclude = ["shell.nix"]
 license = "MIT OR Apache-2.0"
-keywords = ["frozen lab", "frozen core"]
+keywords = ["frozen-lab", "frozen-core"]
 repository = "https://github.com/frozen-lab/frozen-core"
 description = "Custom implementations and core utilities for frozen codebases"
 
