@@ -1,16 +1,17 @@
 [package]
-edition = "2024"
-version = "0.0.1"
 name = "frozen-core"
+edition = "2024"
+version = "0.0.2"
 license = "Apache-2.0"
 exclude = ["shell.nix"]
-description = "Core utilities for frozen codebases"
+keywords = ["frozen lab", "frozen core"]
 repository = "https://github.com/frozen-lab/frozen-core"
+description = "Custom implementations and core utilities for frozen codebases"
 
 [features]
+default = []
 ff = ["libc"]
 fm = ["libc"]
-default = []
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.178", optional = true }

@@ -490,12 +490,7 @@ mod fm_tests {
     const CFG: FMCfg = FMCfg::new(MID);
 
     fn get_ff_cfg(path: PathBuf) -> FFCfg {
-        FFCfg {
-            path,
-            module_id: MID,
-            auto_flush: false,
-            flush_duration: time::Duration::from_secs(1),
-        }
+        FFCfg::new(path, MID)
     }
 
     fn new_tmp() -> (TempDir, PathBuf, FF, FM) {

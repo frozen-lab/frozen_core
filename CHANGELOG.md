@@ -1,5 +1,9 @@
 # Changelog
 
+## `0.0.2`
+
+- Improved `FFCfg` & `FMCfg` w/ builder pattern construction
+
 ## `0.0.1`
 
 - Impl of `fe` (Frozen Error) for custom error repr
