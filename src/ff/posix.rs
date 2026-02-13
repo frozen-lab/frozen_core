@@ -1,9 +1,9 @@
 use super::{new_error, FFErr};
 use crate::fe::FRes;
 use libc::{
-    c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, preadv, pwritev, stat, unlink, EACCES,
-    EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS, ESPIPE, O_CLOEXEC,
-    O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
+    c_int, c_uint, c_void, close, fstat, ftruncate, iovec, off_t, open, preadv, pwritev, stat,
+    unlink, EACCES, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOENT, ENOSPC, ENOTDIR,
+    EPERM, EROFS, ESPIPE, O_CLOEXEC, O_CREAT, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
 };
 use std::{ffi, io, os::unix::ffi::OsStrExt, path, sync::atomic};
 const CLOSED_FD: i32 = -1;
@@ -178,7 +178,7 @@ impl PosixFile {
         let mut retries = 0;
 
         loop {
-            if fdatasync(self.fd() as c_int) != 0 {
+            if libc::fdatasync(self.fd() as c_int) != 0 {
                 let error = last_os_error();
                 let error_raw = error.raw_os_error();
 
@@ -411,7 +411,13 @@ impl PosixFile {
     /// Read at given `offset` w/ `pread` syscall from [`PosixFile`]
     #[cfg(test)]
     #[inline(always)]
-    unsafe fn pread(&self, buf_ptr: *mut u8, offset: usize, len_to_read: usize, mid: u8) -> FRes<()> {
+    unsafe fn pread(
+        &self,
+        buf_ptr: *mut u8,
+        offset: usize,
+        len_to_read: usize,
+        mid: u8,
+    ) -> FRes<()> {
         // sanity checks
         debug_assert_ne!(len_to_read, 0, "invalid length");
         debug_assert!(!buf_ptr.is_null(), "invalid buffer pointer");
@@ -558,7 +564,13 @@ impl PosixFile {
     /// Write at given `offset` w/ `pwrite` syscall to [`PosixFile`]
     #[cfg(test)]
     #[inline(always)]
-    unsafe fn pwrite(&self, buf_ptr: *const u8, offset: usize, len_to_write: usize, mid: u8) -> FRes<()> {
+    unsafe fn pwrite(
+        &self,
+        buf_ptr: *const u8,
+        offset: usize,
+        len_to_write: usize,
+        mid: u8,
+    ) -> FRes<()> {
         // sanity checks
         debug_assert_ne!(len_to_write, 0, "invalid length");
         debug_assert!(!buf_ptr.is_null(), "invalid buffer pointer");
@@ -622,8 +634,13 @@ impl PosixFile {
 ///
 /// To remain sane across ownership models, containers, and shared filesystems,
 /// we explicitly retry the `open()` w/o `O_NOATIME` when `EPERM` is encountered
-unsafe fn open_raw(path: &path::PathBuf, mut flags: i32, mid: u8) -> FRes<i32> {
+unsafe fn open_raw(path: &path::PathBuf, flags: i32, mid: u8) -> FRes<i32> {
     let cpath = path_to_cstring(path, mid)?;
+
+    #[cfg(target_os = "linux")]
+    let mut flags = flags;
+
+    #[cfg(target_os = "linux")]
     let mut tried_noatime = false;
 
     loop {
@@ -631,7 +648,7 @@ unsafe fn open_raw(path: &path::PathBuf, mut flags: i32, mid: u8) -> FRes<i32> {
             open(
                 cpath.as_ptr(),
                 flags,
-                S_IRUSR | S_IWUSR, // write + read permissions
+                (S_IRUSR | S_IWUSR) as c_uint, // write + read permissions
             )
         } else {
             open(cpath.as_ptr(), flags)
@@ -647,10 +664,13 @@ unsafe fn open_raw(path: &path::PathBuf, mut flags: i32, mid: u8) -> FRes<i32> {
             }
 
             // NOTE: Fallback for `EPERM` error, when `O_NOATIME` is not supported by current FS
-            if err_raw == Some(EPERM) && (flags & O_NOATIME) != 0 && !tried_noatime {
-                flags &= !O_NOATIME;
-                tried_noatime = true;
-                continue;
+            #[cfg(target_os = "linux")]
+            {
+                if err_raw == Some(EPERM) && (flags & libc::O_NOATIME) != 0 && !tried_noatime {
+                    flags &= !libc::O_NOATIME;
+                    tried_noatime = true;
+                    continue;
+                }
             }
 
             // no space available on disk
@@ -711,7 +731,7 @@ const fn prep_flags(is_new: bool) -> i32 {
     const BASE: i32 = O_RDWR | O_CLOEXEC;
 
     #[cfg(target_os = "linux")]
-    const BASE: i32 = O_RDWR | O_NOATIME | O_CLOEXEC;
+    const BASE: i32 = O_RDWR | libc::O_NOATIME | O_CLOEXEC;
 
     BASE | ((is_new as i32) * NEW)
 }
@@ -796,7 +816,9 @@ mod tests {
         fn open_fails_when_no_permissions() {
             // NOTE: When running as root (UID 0), perm (read & write) checks are bypassed
             if unsafe { libc::geteuid() } == 0 {
-                panic!("Tests must not run as root (UID 0); root bypasses Unix file permission checks");
+                panic!(
+                    "Tests must not run as root (UID 0); root bypasses Unix file permission checks"
+                );
             }
 
             let (_dir, tmp, file) = new_tmp();
@@ -819,7 +841,9 @@ mod tests {
         fn open_fails_when_read_only_file() {
             // NOTE: When running as root (UID 0), perm (read & write) checks are bypassed
             if unsafe { libc::geteuid() } == 0 {
-                panic!("Tests must not run as root (UID 0); root bypasses Unix file permission checks");
+                panic!(
+                    "Tests must not run as root (UID 0); root bypasses Unix file permission checks"
+                );
             }
 
             let (_dir, tmp, file) = new_tmp();
@@ -934,7 +958,11 @@ mod tests {
 
             // strict sanity check to ensure file is zero byte extended
             let file_contents = std::fs::read(&tmp).expect("read from file");
-            assert_eq!(file_contents.len(), NEW_LEN as usize, "len mismatch for file");
+            assert_eq!(
+                file_contents.len(),
+                NEW_LEN as usize,
+                "len mismatch for file"
+            );
             assert!(
                 file_contents.iter().all(|b| *b == 0u8),
                 "file must be zero byte extended"
@@ -1054,11 +1082,18 @@ mod tests {
                     })
                     .collect();
 
-                assert!(file.preadv(&mut read_iovecs, 0, MID).check_ok(), "preadv failed");
+                assert!(
+                    file.preadv(&mut read_iovecs, 0, MID).check_ok(),
+                    "preadv failed"
+                );
 
                 // verify each buffer
                 for buf in read_bufs.iter() {
-                    assert_eq!(buf.as_slice(), &DATA, "data mismatch in pwritev/preadv cycle");
+                    assert_eq!(
+                        buf.as_slice(),
+                        &DATA,
+                        "data mismatch in pwritev/preadv cycle"
+                    );
                 }
 
                 assert!(file.close(MID).check_ok());
@@ -1112,7 +1147,10 @@ mod tests {
                 let f = file.clone();
                 handles.push(std::thread::spawn(move || {
                     let data = vec![i as u8; CHUNK];
-                    unsafe { f.pwrite(data.as_ptr(), i * CHUNK, CHUNK, MID).expect("write") };
+                    unsafe {
+                        f.pwrite(data.as_ptr(), i * CHUNK, CHUNK, MID)
+                            .expect("write")
+                    };
                 }));
             }
 
@@ -1130,7 +1168,11 @@ mod tests {
             //
 
             let mut read_buf = vec![0u8; THREADS * CHUNK];
-            unsafe { assert!(file.pread(read_buf.as_mut_ptr(), 0, read_buf.len(), MID).check_ok()) };
+            unsafe {
+                assert!(file
+                    .pread(read_buf.as_mut_ptr(), 0, read_buf.len(), MID)
+                    .check_ok())
+            };
 
             for i in 0..THREADS {
                 let chunk = &read_buf[i * CHUNK..(i + 1) * CHUNK];
