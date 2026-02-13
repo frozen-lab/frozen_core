@@ -1,12 +1,11 @@
 use super::{new_error, FFErr};
 use crate::fe::FRes;
 use libc::{
-    c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, pread, preadv, pwrite, pwritev, size_t,
-    stat, unlink, EACCES, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS,
-    ESPIPE, O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
+    c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, preadv, pwritev, stat, unlink, EACCES,
+    EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS, ESPIPE, O_CLOEXEC,
+    O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
 };
 use std::{ffi, io, os::unix::ffi::OsStrExt, path, sync::atomic};
-
 const CLOSED_FD: i32 = -1;
 
 /// Linux implementation of `PosixFile`
@@ -34,6 +33,132 @@ impl PosixFile {
 
     /// Syncs in-mem data on the storage device
     ///
+    /// **NOTE:** This function is `macos` only
+    ///
+    /// ## `F_FULLFSYNC` vs `fsync`
+    ///
+    /// On mac (the supposed best os),`fsync()` does not guarantee that the dirty pages are flushed
+    /// by the storage device, and it may not physically write the data to the platters for
+    /// quite some time
+    ///
+    /// More info [here](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html)
+    ///
+    /// To achieve true crash durability (including protection against power loss),
+    /// we must use `fcntl(fd, F_FULLFSYNC)` which provides strict durability guarantees
+    ///
+    /// If `F_FULLFSYNC` is not supported by the underlying filesystem or device
+    /// (e.g., returns `EINVAL`, `ENOTSUP`, or `EOPNOTSUPP`), we fall back to
+    /// `fsync()` as a best-effort persistence mechanism
+    #[inline(always)]
+    #[cfg(target_os = "macos")]
+    pub(super) unsafe fn sync(&self, mid: u8) -> FRes<()> {
+        // sanity check
+        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
+
+        let fd = self.fd() as c_int;
+
+        // only for EINTR errors
+        const MAX_RETRIES: usize = 4;
+        let mut retries = 0;
+
+        loop {
+            if libc::fcntl(fd, libc::F_FULLFSYNC) != 0 {
+                let error = last_os_error();
+                let error_raw = error.raw_os_error();
+
+                // IO interrupt
+                if error_raw == Some(libc::EINTR) {
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        std::thread::yield_now();
+                        continue;
+                    }
+
+                    // NOTE: sync error indicates that retries exhausted and durability is broken
+                    // in the current/last window/batch
+                    return new_error(mid, FFErr::Syn, error);
+                }
+
+                // lack of support for fullSync (must fallback to fsync)
+                if error_raw == Some(libc::EINVAL)
+                    || error_raw == Some(libc::ENOTSUP)
+                    || error_raw == Some(libc::EOPNOTSUPP)
+                {
+                    break;
+                }
+
+                // invalid fd
+                if error_raw == Some(EBADF) {
+                    return new_error(mid, FFErr::Hcf, error);
+                }
+
+                // read-only file (can also be caused by TOCTOU)
+                if error_raw == Some(EROFS) {
+                    return new_error(mid, FFErr::Wrt, error);
+                }
+
+                // fatel error, i.e. no sync for writes in recent window/batch
+                if error_raw == Some(EIO) {
+                    return new_error(mid, FFErr::Syn, error);
+                }
+
+                return new_error(mid, FFErr::Unk, error);
+            }
+
+            return Ok(());
+        }
+
+        // NOTE: As a fallback to `F_FULLFSYNC` we use `fsync`
+        //
+        // HACK: On mac, fsync does NOT mean "data is on disk". The drive is still free to cache,
+        // reorder, and generally do whatever it wants with your supposedly "synced" data. But for us,
+        // this is the least-bad fallback when `F_FULLFSYNC` isn’t supported or working
+
+        retries = 0;
+        loop {
+            if libc::fsync(fd) != 0 {
+                let error = last_os_error();
+                let error_raw = error.raw_os_error();
+
+                // IO interrupt
+                if error_raw == Some(libc::EINTR) {
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        std::thread::yield_now();
+                        continue;
+                    }
+
+                    // NOTE: sync error indicates that retries exhausted and durability is broken
+                    // in the current/last window/batch
+                    return new_error(mid, FFErr::Syn, error);
+                }
+
+                // invalid fd or lack of support for sync
+                if error_raw == Some(libc::EBADF) || error_raw == Some(libc::EINVAL) {
+                    return new_error(mid, FFErr::Hcf, error);
+                }
+
+                // read-only file (can also be caused by TOCTOU)
+                if error_raw == Some(libc::EROFS) {
+                    return new_error(mid, FFErr::Wrt, error);
+                }
+
+                // fatel error, i.e. no sync for writes in recent window/batch
+                if error_raw == Some(libc::EIO) {
+                    return new_error(mid, FFErr::Syn, error);
+                }
+
+                return new_error(mid, FFErr::Unk, error);
+            }
+
+            return Ok(());
+        }
+    }
+
+    /// Syncs in-mem data on the storage device
+    ///
+    /// **NOTE:** This function is `linux` only
+    ///
     /// ## `fsync` vs `fdatasync`
     ///
     /// We use `fdatasync()` instead of `fsync()` for persistence. As, `fdatasync()` guarantees,
@@ -42,12 +167,13 @@ impl PosixFile {
     ///
     /// This way we avoid non-essential metadata updates, such as access time (`atime`),
     /// mod time (`mtime`), and other inode bookkeeping info!
-    #[inline]
+    #[inline(always)]
+    #[cfg(target_os = "linux")]
     pub(super) unsafe fn sync(&self, mid: u8) -> FRes<()> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
 
-        // only for EIO errors
+        // only for EIO & EINTR errors
         const MAX_RETRIES: usize = 4;
         let mut retries = 0;
 
@@ -141,7 +267,7 @@ impl PosixFile {
     }
 
     /// Fetches current length of [`PosixFile`] using `fstat` syscall
-    #[inline]
+    #[inline(always)]
     pub(super) unsafe fn length(&self, mid: u8) -> FRes<u64> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
@@ -165,6 +291,7 @@ impl PosixFile {
     }
 
     /// Resize [`PosixFile`] w/ `new_len`
+    #[inline(always)]
     pub(super) unsafe fn resize(&self, new_len: u64, mid: u8) -> FRes<()> {
         // sanity check
         debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPosixFile");
@@ -282,8 +409,8 @@ impl PosixFile {
     }
 
     /// Read at given `offset` w/ `pread` syscall from [`PosixFile`]
+    #[cfg(test)]
     #[inline(always)]
-    #[allow(unused)]
     unsafe fn pread(&self, buf_ptr: *mut u8, offset: usize, len_to_read: usize, mid: u8) -> FRes<()> {
         // sanity checks
         debug_assert_ne!(len_to_read, 0, "invalid length");
@@ -292,10 +419,10 @@ impl PosixFile {
 
         let mut read = 0usize;
         while read < len_to_read {
-            let res = pread(
+            let res = libc::pread(
                 self.fd(),
                 buf_ptr.add(read) as *mut c_void,
-                (len_to_read - read) as size_t,
+                (len_to_read - read) as libc::size_t,
                 (offset + read) as i64,
             );
 
@@ -429,8 +556,8 @@ impl PosixFile {
     }
 
     /// Write at given `offset` w/ `pwrite` syscall to [`PosixFile`]
+    #[cfg(test)]
     #[inline(always)]
-    #[allow(unused)]
     unsafe fn pwrite(&self, buf_ptr: *const u8, offset: usize, len_to_write: usize, mid: u8) -> FRes<()> {
         // sanity checks
         debug_assert_ne!(len_to_write, 0, "invalid length");
@@ -439,10 +566,10 @@ impl PosixFile {
 
         let mut written = 0usize;
         while written < len_to_write {
-            let res = pwrite(
+            let res = libc::pwrite(
                 self.fd(),
                 buf_ptr.add(written) as *const c_void,
-                (len_to_write - written) as size_t,
+                (len_to_write - written) as libc::size_t,
                 (offset + written) as i64,
             );
 
@@ -604,7 +731,7 @@ fn last_os_error() -> std::io::Error {
     io::Error::last_os_error()
 }
 
-#[cfg(all(test, any(target_os = "linux")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::fe::{FECheckOk, MID};
