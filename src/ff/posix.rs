@@ -5,18 +5,12 @@ use libc::{
     stat, unlink, EACCES, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS,
     ESPIPE, O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
 };
-use std::{
-    ffi::CString,
-    io,
-    os::unix::ffi::OsStrExt,
-    path::PathBuf,
-    sync::atomic::{AtomicI32, Ordering},
-};
+use std::{ffi, io, os::unix::ffi::OsStrExt, path, sync::atomic};
 
 const CLOSED_FD: i32 = -1;
 
 /// Linux implementation of `PosixFile`
-pub(super) struct PosixFile(AtomicI32);
+pub(super) struct PosixFile(atomic::AtomicI32);
 
 unsafe impl Send for PosixFile {}
 unsafe impl Sync for PosixFile {}
@@ -27,15 +21,15 @@ impl PosixFile {
     /// ## Errors
     ///
     /// - `FFErr::Inv` is thrown when the given `path` is either invalid or missing sub-dir's
-    pub(super) unsafe fn new(path: &PathBuf, is_new: bool, mid: u8) -> FRes<Self> {
+    pub(super) unsafe fn new(path: &path::PathBuf, is_new: bool, mid: u8) -> FRes<Self> {
         let fd = open_raw(path, prep_flags(is_new), mid)?;
-        Ok(Self(AtomicI32::new(fd)))
+        Ok(Self(atomic::AtomicI32::new(fd)))
     }
 
     /// Get file descriptor for [`PosixFile`]
     #[inline]
     pub(super) fn fd(&self) -> i32 {
-        self.0.load(Ordering::Acquire)
+        self.0.load(atomic::Ordering::Acquire)
     }
 
     /// Syncs in-mem data on the storage device
@@ -107,7 +101,7 @@ impl PosixFile {
     #[inline(always)]
     pub(super) unsafe fn close(&self, mid: u8) -> FRes<()> {
         // prevent multiple close syscalls
-        let fd = self.0.swap(CLOSED_FD, Ordering::AcqRel);
+        let fd = self.0.swap(CLOSED_FD, atomic::Ordering::AcqRel);
         if fd == CLOSED_FD {
             return Ok(());
         }
@@ -136,7 +130,7 @@ impl PosixFile {
     ///
     /// **WARN**: PosixFile must be closed beforehand, to avoid I/O errors
     #[inline]
-    pub(super) unsafe fn unlink(&self, path: &PathBuf, mid: u8) -> FRes<()> {
+    pub(super) unsafe fn unlink(&self, path: &path::PathBuf, mid: u8) -> FRes<()> {
         let cpath = path_to_cstring(path, mid)?;
         if unlink(cpath.as_ptr()) != 0 {
             let error = last_os_error();
@@ -501,7 +495,7 @@ impl PosixFile {
 ///
 /// To remain sane across ownership models, containers, and shared filesystems,
 /// we explicitly retry the `open()` w/o `O_NOATIME` when `EPERM` is encountered
-unsafe fn open_raw(path: &PathBuf, mut flags: i32, mid: u8) -> FRes<i32> {
+unsafe fn open_raw(path: &path::PathBuf, mut flags: i32, mid: u8) -> FRes<i32> {
     let cpath = path_to_cstring(path, mid)?;
     let mut tried_noatime = false;
 
@@ -547,6 +541,16 @@ unsafe fn open_raw(path: &PathBuf, mut flags: i32, mid: u8) -> FRes<i32> {
                 return new_error(mid, FFErr::Inv, error);
             }
 
+            // permission denied
+            if err_raw == Some(EACCES) || err_raw == Some(EPERM) {
+                return new_error(mid, FFErr::Red, error);
+            }
+
+            // read-only fs
+            if err_raw == Some(EROFS) {
+                return new_error(mid, FFErr::Wrt, error);
+            }
+
             return new_error(mid, FFErr::Unk, error);
         }
 
@@ -558,25 +562,35 @@ unsafe fn open_raw(path: &PathBuf, mut flags: i32, mid: u8) -> FRes<i32> {
 ///
 /// ## Access Time Updates (O_NOATIME)
 ///
-/// We use the `O_NOATIME` flag to disable access time updates on the [`PosixFile`]
+/// We use the `O_NOATIME` flag (**Linux Only**) to disable access time updates on the [`PosixFile`]
 /// Normally every I/O operation triggers an `atime` update/write to disk
 ///
 /// This is counter productive and increases latency for I/O ops in our case!
 ///
 /// ## Limitations of `O_NOATIME`
 ///
-/// Not all filesystems support this flag, on many it is silently ignored, but some rejects
-/// it with `EPERM` error
+/// Macos does not support this flag
 ///
-/// Also, this flag only works when UID's match for calling processe and file owner
+/// On Linux, not all filesystems support this flag on Linux either, on many it is silently ignored,
+/// but some rejects it with `EPERM` error
+///
+/// The flag only works when the UID's are matched for calling processe and file owner
 const fn prep_flags(is_new: bool) -> i32 {
-    const BASE: i32 = O_RDWR | O_NOATIME | O_CLOEXEC;
     const NEW: i32 = O_CREAT | O_TRUNC;
+
+    // NOTE: `O_NOATIME` is not supported on `macos`
+
+    #[cfg(target_os = "macos")]
+    const BASE: i32 = O_RDWR | O_CLOEXEC;
+
+    #[cfg(target_os = "linux")]
+    const BASE: i32 = O_RDWR | O_NOATIME | O_CLOEXEC;
+
     BASE | ((is_new as i32) * NEW)
 }
 
-fn path_to_cstring(path: &std::path::PathBuf, mid: u8) -> FRes<CString> {
-    match CString::new(path.as_os_str().as_bytes()) {
+fn path_to_cstring(path: &std::path::PathBuf, mid: u8) -> FRes<ffi::CString> {
+    match ffi::CString::new(path.as_os_str().as_bytes()) {
         Ok(cs) => Ok(cs),
         Err(e) => {
             let error = io::Error::new(io::ErrorKind::Other, e.to_string());
@@ -594,10 +608,11 @@ fn last_os_error() -> std::io::Error {
 mod tests {
     use super::*;
     use crate::fe::{FECheckOk, MID};
-    use std::path::PathBuf;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::{tempdir, TempDir};
 
-    fn new_tmp() -> (TempDir, PathBuf, PosixFile) {
+    fn new_tmp() -> (TempDir, path::PathBuf, PosixFile) {
         let dir = tempdir().expect("temp dir");
         let tmp = dir.path().join("tmp_file");
         let file = unsafe { PosixFile::new(&tmp, true, MID) }.expect("new LinuxPosixFile");
@@ -607,6 +622,7 @@ mod tests {
 
     mod new_open {
         use super::*;
+        use crate::fe::from_err_code;
 
         #[test]
         fn new_works() {
@@ -647,6 +663,52 @@ mod tests {
                 let file = PosixFile::new(&tmp, false, MID);
                 assert!(file.is_err());
             }
+        }
+
+        #[test]
+        fn open_fails_when_no_permissions() {
+            // NOTE: When running as root (UID 0), perm (read & write) checks are bypassed
+            if unsafe { libc::geteuid() } == 0 {
+                panic!("Tests must not run as root (UID 0); root bypasses Unix file permission checks");
+            }
+
+            let (_dir, tmp, file) = new_tmp();
+
+            // remove all permissions
+            unsafe { assert!(file.close(MID).check_ok()) };
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+            // re-open
+            let res = unsafe { PosixFile::new(&tmp, false, MID) };
+
+            assert!(res.is_err());
+            let err = res.err().expect("must fail");
+
+            let (_, _, code) = from_err_code(err.code);
+            assert_eq!(code, FFErr::Red as u16);
+        }
+
+        #[test]
+        fn open_fails_when_read_only_file() {
+            // NOTE: When running as root (UID 0), perm (read & write) checks are bypassed
+            if unsafe { libc::geteuid() } == 0 {
+                panic!("Tests must not run as root (UID 0); root bypasses Unix file permission checks");
+            }
+
+            let (_dir, tmp, file) = new_tmp();
+
+            // read-only permission
+            unsafe { assert!(file.close(MID).check_ok()) };
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o400)).expect("chmod");
+
+            // re-open
+            let res = unsafe { PosixFile::new(&tmp, false, MID) };
+
+            assert!(res.is_err());
+            let err = res.err().expect("must fail");
+
+            let (_, _, code) = from_err_code(err.code);
+            assert_eq!(code, FFErr::Red as u16);
         }
     }
 

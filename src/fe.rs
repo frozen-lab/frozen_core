@@ -88,17 +88,18 @@ pub const fn new_err_code(module: u8, domain: u8, reason: u16) -> FECode {
     ((module as u32) << 24) | ((domain as u32) << 16) | (reason as u32)
 }
 
+/// De-construct an [`FECode`] error code into raw values
+pub const fn from_err_code(code: FECode) -> (u8, u8, u16) {
+    let reason = code as u16;
+    let domain = (code >> 16) as u8;
+    let module = (code >> 24) as u8;
+
+    (module, domain, reason)
+}
+
 #[cfg(test)]
-mod fe {
+mod tests {
     use super::*;
-
-    const fn from_err_code(code: FECode) -> (u8, u8, u16) {
-        let reason = code as u16;
-        let domain = (code >> 16) as u8;
-        let module = (code >> 24) as u8;
-
-        (module, domain, reason)
-    }
 
     #[test]
     fn err_code_roundtrip() {
