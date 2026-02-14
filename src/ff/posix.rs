@@ -197,51 +197,53 @@ impl POSIXFile {
 
         // sanity checks
         debug_assert!(fd != CLOSED_FD, "Invalid fd for LinuxPOSIXFile");
-        debug_assert!(curr_len <= new_len, "new_len must not be smaller then curr len");
+        debug_assert!(curr_len < new_len, "new_len must not be smaller then curr len");
 
         #[cfg(target_os = "linux")]
         {
             let mut retries = 0;
             loop {
-                if libc::fallocate(fd, 0, curr_len as off_t, (new_len - curr_len) as off_t) != 0 {
-                    let error = last_os_error();
-                    let error_raw = error.raw_os_error();
+                if libc::fallocate(fd, 0, curr_len as off_t, (new_len - curr_len) as off_t) == 0 {
+                    return Ok(());
+                }
 
-                    match error_raw {
-                        // IO interrupt
-                        Some(EINTR) => {
-                            if retries < MAX_RETRIES {
-                                retries += 1;
-                                continue;
-                            }
+                let error = last_os_error();
+                let error_raw = error.raw_os_error();
 
-                            break;
+                match error_raw {
+                    // IO interrupt
+                    Some(EINTR) => {
+                        if retries < MAX_RETRIES {
+                            retries += 1;
+                            continue;
                         }
 
-                        // invalid fd
-                        Some(libc::EBADF) => {
-                            return new_error(mid, FFErr::Hcf, error);
-                        }
+                        break;
+                    }
 
-                        // read-only fs (can also be caused by TOCTOU)
-                        Some(libc::EROFS) => {
-                            return new_error(mid, FFErr::Wrt, error);
-                        }
+                    // invalid fd
+                    Some(libc::EBADF) => {
+                        return new_error(mid, FFErr::Hcf, error);
+                    }
 
-                        // no space available on disk
-                        Some(libc::ENOSPC) => {
-                            return new_error(mid, FFErr::Nsp, error);
-                        }
+                    // read-only fs (can also be caused by TOCTOU)
+                    Some(libc::EROFS) => {
+                        return new_error(mid, FFErr::Wrt, error);
+                    }
 
-                        // lack of support for `fallocate`
-                        Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => {
-                            // fall through to ftruncate
-                            break;
-                        }
+                    // no space available on disk
+                    Some(libc::ENOSPC) => {
+                        return new_error(mid, FFErr::Nsp, error);
+                    }
 
-                        _ => {
-                            return new_error(mid, FFErr::Unk, error);
-                        }
+                    // lack of support for `fallocate`
+                    Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => {
+                        // fall through to ftruncate
+                        break;
+                    }
+
+                    _ => {
+                        return new_error(mid, FFErr::Unk, error);
                     }
                 }
             }
@@ -834,8 +836,6 @@ unsafe fn fullsync_raw(fd: c_int, mid: u8) -> FRes<()> {
 #[cfg(target_os = "linux")]
 unsafe fn fdatasync_raw(fd: FD, mid: u8) -> FRes<()> {
     // only for EIO & EINTR errors
-
-    use libc::EINTR;
     let mut retries = 0;
     loop {
         if libc::fdatasync(fd) != 0 {
@@ -844,7 +844,14 @@ unsafe fn fdatasync_raw(fd: FD, mid: u8) -> FRes<()> {
 
             // IO interrupt (must retry)
             if error_raw == Some(EINTR) {
-                continue;
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    continue;
+                }
+
+                // NOTE: sync error indicates that retries exhausted and durability is broken
+                // in the current/last window/batch
+                return new_error(mid, FFErr::Syn, error);
             }
 
             // invalid fd or lack of support for sync
