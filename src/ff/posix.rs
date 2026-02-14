@@ -1,17 +1,25 @@
 use super::{new_error, FFErr};
 use crate::fe::FRes;
 use libc::{
-    c_int, c_uint, c_void, close, fstat, ftruncate, iovec, off_t, open, preadv, pwritev, stat, unlink, EACCES, EBADF,
-    EDQUOT, EFAULT, EINTR, EINVAL, EIO, EISDIR, EMSGSIZE, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS, ESPIPE, O_CLOEXEC,
-    O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
+    c_int, c_uint, c_void, close, fstat, ftruncate, iovec, off_t, open, preadv, pwritev, stat, sysconf, unlink, EACCES,
+    EBADF, EDQUOT, EFAULT, EINTR, EINVAL, EIO, EISDIR, EMSGSIZE, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS, ESPIPE,
+    O_CLOEXEC, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR, _SC_IOV_MAX,
 };
-use std::{ffi, io, os::unix::ffi::OsStrExt, path, sync::atomic};
+use std::{
+    ffi, io,
+    os::unix::ffi::OsStrExt,
+    path,
+    sync::{self, atomic},
+};
 
 /// type for file descriptor on POSIX systems
 type FD = c_int;
 
 const CLOSED_FD: FD = -1;
 const MAX_RETRIES: usize = 6; // max allowed retries for `EINTR` errors
+const MAX_IOVECS: usize = 512; // max iovecs allowed for single readv/writev calls
+
+static IOV_MAX_CACHE: sync::OnceLock<usize> = sync::OnceLock::new();
 
 /// Linux implementation of `POSIXFile`
 pub(super) struct POSIXFile(atomic::AtomicI32);
@@ -195,15 +203,20 @@ impl POSIXFile {
             }
         }
 
+        let fd = self.fd();
+        let max_iovs = max_iovecs();
+        let iovecs_len = iovecs.len();
+        let iov_size = iovecs[0].iov_len;
+
         let mut head = 0usize;
         let mut consumed = 0usize;
 
-        let iovecs_len = iovecs.len();
         while head < iovecs_len {
+            let remaining_iov = iovecs_len - head;
+            let cnt = remaining_iov.min(max_iovs) as c_int;
             let ptr = iovecs.as_ptr().add(head);
-            let cnt = (iovecs_len - head) as c_int;
 
-            let res = preadv(self.fd(), ptr, cnt, offset as off_t + consumed as off_t);
+            let res = preadv(fd, ptr, cnt, offset as off_t + consumed as off_t);
             if res <= 0 {
                 let error = io::Error::last_os_error();
                 let error_raw = error.raw_os_error();
@@ -245,20 +258,117 @@ impl POSIXFile {
             // Even though this behavior is situation or filesystem dependent (according to my short research),
             // we opt to handle it for correctness across different systems
 
-            let mut remaining = res as usize;
-            while remaining > 0 {
-                let iov = &mut iovecs[head];
+            let written = res as usize;
+            let full_pages = written / iov_size;
+            let partial = written % iov_size;
 
-                if remaining >= iov.iov_len {
-                    remaining -= iov.iov_len;
-                    consumed += iov.iov_len;
-                    head += 1;
-                } else {
-                    iov.iov_base = (iov.iov_base as *mut u8).add(remaining) as *mut c_void;
-                    iov.iov_len -= remaining;
-                    consumed += remaining;
-                    remaining = 0;
+            // fully written pages
+            head += full_pages;
+            consumed += full_pages * iov_size;
+
+            // partially written page (rare)
+            if partial > 0 {
+                let iov = &mut iovecs[head];
+                iov.iov_base = (iov.iov_base as *mut u8).add(partial) as *mut c_void;
+                iov.iov_len -= partial;
+                consumed += partial;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write (multiple vectors) at given `offset` w/ `pwritev` syscall to [`POSIXFile`]
+    #[inline(always)]
+    pub(super) unsafe fn pwritev(&self, iovecs: &mut [iovec], offset: usize, mid: u8) -> FRes<()> {
+        // sanity checks
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPOSIXFile");
+            debug_assert_ne!(iovecs.len(), 0, "iovecs must not be empty");
+
+            let iov_len = iovecs[0].iov_len;
+            debug_assert_ne!(iov_len, 0, "invalid iov length");
+
+            for iov in iovecs.iter() {
+                debug_assert_eq!(iov_len, iov.iov_len, "all iov's must be of same length");
+            }
+        }
+
+        let fd = self.fd();
+        let max_iovs = max_iovecs();
+        let iovecs_len = iovecs.len();
+        let iov_size = iovecs[0].iov_len;
+
+        let mut head = 0usize;
+        let mut consumed = 0usize;
+
+        while head < iovecs_len {
+            let remaining_iov = iovecs_len - head;
+            let cnt = remaining_iov.min(max_iovs) as c_int;
+            let ptr = iovecs.as_ptr().add(head);
+
+            let res = pwritev(fd, ptr, cnt, offset as off_t + consumed as off_t);
+            if res <= 0 {
+                let error = std::io::Error::last_os_error();
+                let error_raw = error.raw_os_error();
+
+                // io interrupt
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
+
+                // unexpected EOF
+                if res == 0 {
+                    return new_error(mid, FFErr::Eof, error);
+                }
+
+                // read-only file (can also be caused by TOCTOU)
+                if error_raw == Some(EROFS) {
+                    return new_error(mid, FFErr::Wrt, error);
+                }
+
+                // no space available on disk
+                if error_raw == Some(ENOSPC) || error_raw == Some(EDQUOT) {
+                    return new_error(mid, FFErr::Nsp, error);
+                }
+
+                // invalid fd, invalid fd type, bad pointer, etc.
+                if error_raw == Some(EINVAL)
+                    || error_raw == Some(EBADF)
+                    || error_raw == Some(EFAULT)
+                    || error_raw == Some(ESPIPE)
+                    || error_raw == Some(EMSGSIZE)
+                {
+                    return new_error(mid, FFErr::Hcf, error);
+                }
+
+                return new_error(mid, FFErr::Unk, error);
+            }
+
+            // NOTE: In POSIX systems, pwritev may -
+            //
+            // - write fewer bytes than requested
+            // - stop in-between iovec's
+            // - stop mid iovec
+            //
+            // Even though this behavior is situation or filesystem dependent (according to my short research),
+            // we opt to handle it for correctness across different systems
+
+            let written = res as usize;
+            let full_pages = written / iov_size;
+            let partial = written % iov_size;
+
+            // fully written pages
+            head += full_pages;
+            consumed += full_pages * iov_size;
+
+            // partially written page (rare)
+            if partial > 0 {
+                let iov = &mut iovecs[head];
+                iov.iov_base = (iov.iov_base as *mut u8).add(partial) as *mut c_void;
+                iov.iov_len -= partial;
+                consumed += partial;
             }
         }
 
@@ -315,98 +425,6 @@ impl POSIXFile {
             }
 
             read += res as usize;
-        }
-
-        Ok(())
-    }
-
-    /// Write (multiple vectors) at given `offset` w/ `pwritev` syscall to [`POSIXFile`]
-    #[inline(always)]
-    pub(super) unsafe fn pwritev(&self, iovecs: &mut [iovec], offset: usize, mid: u8) -> FRes<()> {
-        // sanity checks
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPOSIXFile");
-            debug_assert_ne!(iovecs.len(), 0, "iovecs must not be empty");
-
-            let iov_len = iovecs[0].iov_len;
-            debug_assert_ne!(iov_len, 0, "invalid iov length");
-
-            for iov in iovecs.iter() {
-                debug_assert_eq!(iov_len, iov.iov_len, "all iov's must be of same length");
-            }
-        }
-
-        let mut head = 0usize;
-        let mut consumed = 0usize;
-
-        let iovecs_len = iovecs.len();
-        while head < iovecs_len {
-            let ptr = iovecs.as_ptr().add(head);
-            let cnt = (iovecs_len - head) as c_int;
-
-            let res = pwritev(self.fd(), ptr, cnt, offset as off_t + consumed as off_t);
-            if res <= 0 {
-                let error = std::io::Error::last_os_error();
-                let error_raw = error.raw_os_error();
-
-                // io interrupt
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-
-                // unexpected EOF
-                if res == 0 {
-                    return new_error(mid, FFErr::Eof, error);
-                }
-
-                // read-only file (can also be caused by TOCTOU)
-                if error_raw == Some(EROFS) {
-                    return new_error(mid, FFErr::Wrt, error);
-                }
-
-                // no space available on disk
-                if error_raw == Some(ENOSPC) || error_raw == Some(EDQUOT) {
-                    return new_error(mid, FFErr::Nsp, error);
-                }
-
-                // invalid fd, invalid fd type, bad pointer, etc.
-                if error_raw == Some(EINVAL)
-                    || error_raw == Some(EBADF)
-                    || error_raw == Some(EFAULT)
-                    || error_raw == Some(ESPIPE)
-                    || error_raw == Some(EMSGSIZE)
-                {
-                    return new_error(mid, FFErr::Hcf, error);
-                }
-
-                return new_error(mid, FFErr::Unk, error);
-            }
-
-            // NOTE: In POSIX systems, pwritev may -
-            //
-            // - write fewer bytes than requested
-            // - stop in-between iovec's
-            // - stop mid iovec
-            //
-            // Even though this behavior is situation or filesystem dependent (according to my short research),
-            // we opt to handle it for correctness across different systems
-
-            let mut remaining = res as usize;
-            while remaining > 0 {
-                let iov = &mut iovecs[head];
-
-                if remaining >= iov.iov_len {
-                    remaining -= iov.iov_len;
-                    consumed += iov.iov_len;
-                    head += 1;
-                } else {
-                    iov.iov_base = (iov.iov_base as *mut u8).add(remaining) as *mut c_void;
-                    iov.iov_len -= remaining;
-                    consumed += remaining;
-                    remaining = 0;
-                }
-            }
         }
 
         Ok(())
@@ -591,7 +609,6 @@ unsafe fn fsync_raw(fd: FD, mid: u8) -> FRes<()> {
             if error_raw == Some(EINTR) {
                 if retries < MAX_RETRIES {
                     retries += 1;
-                    std::thread::yield_now();
                     continue;
                 }
 
@@ -658,7 +675,6 @@ unsafe fn fullsync_raw(fd: c_int, mid: u8) -> FRes<()> {
             if error_raw == Some(EINTR) {
                 if retries < MAX_RETRIES {
                     retries += 1;
-                    std::thread::yield_now();
                     continue;
                 }
 
@@ -763,7 +779,6 @@ unsafe fn fdatasync_raw(fd: FD, mid: u8) -> FRes<()> {
             if error_raw == Some(EIO) {
                 if retries < MAX_RETRIES {
                     retries += 1;
-                    std::thread::yield_now();
                     continue;
                 }
 
@@ -804,6 +819,18 @@ unsafe fn sync_parent_dir(path: &path::PathBuf, mid: u8) -> FRes<()> {
     close_raw(fd, mid)?;
 
     res
+}
+
+/// fetch max allowed `iovecs` per `preadv` & `pwritev` syscalls
+fn max_iovecs() -> usize {
+    *IOV_MAX_CACHE.get_or_init(|| unsafe {
+        let res = sysconf(_SC_IOV_MAX);
+        if res <= 0 {
+            MAX_IOVECS
+        } else {
+            res as usize
+        }
+    })
 }
 
 /// prep flags for `open` syscall
