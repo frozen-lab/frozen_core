@@ -1,10 +1,11 @@
 use super::{new_error, FFErr};
 use crate::{fe::FRes, hints};
+use core::sync::atomic;
 use libc::{
     c_int, c_uint, close, fstat, ftruncate, off_t, open, stat, unlink, EACCES, EBADF, EFAULT, EINTR, EINVAL, EIO,
     EISDIR, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS, O_CLOEXEC, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
 };
-use std::{ffi, io, os::unix::ffi::OsStrExt, path, sync::atomic};
+use std::{ffi, io, os::unix::ffi::OsStrExt, path};
 
 /// type for file descriptor on POSIX systems
 type FD = c_int;
@@ -29,11 +30,15 @@ impl POSIXFile {
     pub(super) unsafe fn new(path: &path::PathBuf, mid: u8) -> FRes<Self> {
         let fd = open_raw(path, prep_flags(true), mid)?;
 
-        #[cfg(target_os = "macos")]
-        fullsync_raw(fd, mid)?;
+        // NOTE: On POSIX, `open(O_CREATE)` only creates the directory entry in memory,
+        // it may be visible immediately, but it's existence is not crash durable, for
+        // crash safe durability, we must do `fsync(file)` & `fsync(dir)`
 
         #[cfg(target_os = "linux")]
         fsync_raw(fd, mid)?;
+
+        #[cfg(target_os = "macos")]
+        fullsync_raw(fd, mid)?;
 
         sync_parent_dir(path, mid)?;
 
@@ -104,9 +109,6 @@ impl POSIXFile {
     /// Read current length of [`POSIXFile`] using file metadata (w/ `fstat` syscall)
     #[inline(always)]
     pub(super) unsafe fn length(&self, mid: u8) -> FRes<u64> {
-        // sanity check
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPOSIXFile");
-
         let mut st = std::mem::zeroed::<stat>();
         let res = fstat(self.fd(), &mut st);
 
@@ -139,10 +141,7 @@ impl POSIXFile {
     #[inline(always)]
     pub(super) unsafe fn grow(&self, curr_len: u64, len_to_add: u64, mid: u8) -> FRes<()> {
         let fd = self.fd();
-
-        // sanity check
-        debug_assert!(len_to_add != 0, "len_to_add must never be 0");
-        debug_assert!(fd != CLOSED_FD, "Invalid fd for LinuxPOSIXFile");
+        let new_len = (curr_len + len_to_add) as off_t;
 
         #[cfg(target_os = "linux")]
         {
@@ -183,7 +182,7 @@ impl POSIXFile {
             }
         }
 
-        let res = ftruncate(fd, (curr_len + len_to_add) as off_t);
+        let res = ftruncate(fd, new_len);
         if hints::unlikely(res != 0) {
             let error = last_os_error();
             match error.raw_os_error() {
@@ -224,8 +223,6 @@ impl POSIXFile {
     #[inline(always)]
     #[cfg(target_os = "macos")]
     pub(super) unsafe fn sync(&self, mid: u8) -> FRes<()> {
-        // sanity check
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPOSIXFile");
         fullsync_raw(self.fd() as c_int, mid)
     }
 
@@ -244,8 +241,6 @@ impl POSIXFile {
     #[inline(always)]
     #[cfg(target_os = "linux")]
     pub(super) unsafe fn sync(&self, mid: u8) -> FRes<()> {
-        // sanity check
-        debug_assert!(self.fd() != CLOSED_FD, "Invalid fd for LinuxPOSIXFile");
         fdatasync_raw(self.fd(), mid)
     }
 }
@@ -598,4 +593,367 @@ fn path_to_cstring(path: &path::PathBuf, mid: u8) -> FRes<ffi::CString> {
 #[inline]
 fn last_os_error() -> std::io::Error {
     io::Error::last_os_error()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fe::{from_err_code, FECheckOk, MID};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::{tempdir, TempDir};
+
+    fn new_tmp() -> (TempDir, path::PathBuf, POSIXFile) {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+        let file = unsafe { POSIXFile::new(&tmp, MID) }.expect("new POSIXFile");
+
+        (dir, tmp, file)
+    }
+
+    mod file_new_and_open {
+        use super::*;
+
+        #[test]
+        fn new_works() {
+            let (_dir, tmp, file) = new_tmp();
+            assert!(file.fd() >= 0);
+
+            // sanity check
+            assert!(tmp.exists());
+            assert!(unsafe { file.close(MID).check_ok() });
+        }
+
+        #[test]
+        fn open_works() {
+            let (_dir, tmp, file) = new_tmp();
+            unsafe {
+                assert!(file.fd() >= 0);
+                assert!(file.close(MID).check_ok());
+
+                match POSIXFile::open(&tmp, MID) {
+                    Ok(file) => {
+                        assert!(file.fd() >= 0);
+                        assert!(file.close(MID).check_ok());
+                    }
+                    Err(e) => panic!("failed to open file due to E: {:?}", e),
+                }
+            }
+        }
+
+        #[test]
+        fn open_fails_when_file_is_unlinked() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.fd() >= 0);
+                assert!(file.close(MID).check_ok());
+                assert!(file.unlink(&tmp, MID).check_ok());
+
+                let file = POSIXFile::open(&tmp, MID);
+                assert!(file.is_err());
+            }
+        }
+
+        #[test]
+        fn open_fails_when_no_permissions() {
+            // NOTE: When running as root (UID 0), perm (read & write) checks are bypassed
+            if unsafe { libc::geteuid() } == 0 {
+                panic!("Tests must not run as root (UID 0); root bypasses Unix file permission checks");
+            }
+
+            let (_dir, tmp, file) = new_tmp();
+
+            // remove all permissions
+            unsafe { assert!(file.close(MID).check_ok()) };
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+            // re-open
+            let res = unsafe { POSIXFile::open(&tmp, MID) };
+
+            assert!(res.is_err());
+            let err = res.err().expect("must fail");
+
+            let (_, _, code) = from_err_code(err.code);
+            assert_eq!(code, FFErr::Red as u16);
+        }
+
+        #[test]
+        fn open_fails_when_read_only_file() {
+            // NOTE: When running as root (UID 0), perm (read & write) checks are bypassed
+            if unsafe { libc::geteuid() } == 0 {
+                panic!("Tests must not run as root (UID 0); root bypasses Unix file permission checks");
+            }
+
+            let (_dir, tmp, file) = new_tmp();
+
+            // read-only permission
+            unsafe { assert!(file.close(MID).check_ok()) };
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o400)).expect("chmod");
+
+            // re-open
+            let res = unsafe { POSIXFile::open(&tmp, MID) };
+
+            assert!(res.is_err());
+            let err = res.err().expect("must fail");
+
+            let (_, _, code) = from_err_code(err.code);
+            assert_eq!(code, FFErr::Red as u16);
+        }
+
+        #[test]
+        fn open_fails_on_directory() {
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().to_path_buf();
+
+            let res = unsafe { POSIXFile::open(&path, MID) };
+            assert!(res.is_err());
+
+            let err = res.err().expect("must fail");
+            let (_, _, code) = from_err_code(err.code);
+
+            // opening directory with O_RDWR (EISDIR)
+            assert_eq!(code, FFErr::Hcf as u16);
+        }
+
+        #[test]
+        fn new_works_on_existing_file() {
+            let (dir, tmp, file) = new_tmp();
+
+            unsafe {
+                file.grow(0, 0x800, MID).expect("grow");
+                assert!(file.close(MID).check_ok());
+            }
+
+            let file2 = unsafe { POSIXFile::new(&tmp, MID) }.expect("recreate");
+
+            unsafe {
+                let len = file2.length(MID).expect("length");
+
+                assert_eq!(len, 0);
+                assert!(file2.close(MID).check_ok());
+            }
+
+            drop(dir);
+        }
+
+        #[test]
+        fn new_fails_on_missing_parent_directory() {
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("missing").join("file");
+
+            let res = unsafe { POSIXFile::new(&path, MID) };
+            assert!(res.is_err());
+
+            let err = res.err().expect("must fail");
+            let (_, _, code) = from_err_code(err.code);
+            assert_eq!(code, FFErr::Inv as u16);
+        }
+    }
+
+    mod file_close {
+        use super::*;
+
+        #[test]
+        fn close_works() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close(MID).check_ok());
+
+                // sanity check
+                assert!(tmp.exists());
+            }
+        }
+
+        #[test]
+        fn close_after_close_does_not_fail() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                // should never fail
+                assert!(file.close(MID).check_ok());
+                assert!(file.close(MID).check_ok());
+                assert!(file.close(MID).check_ok());
+
+                // sanity check
+                assert!(tmp.exists());
+            }
+
+            // NOTE: We need this protection, cause in multithreaded env's, more then one thread
+            // could try to close the file at same time, hence the system should not panic in these cases
+        }
+    }
+
+    mod length_and_grow {
+        use super::*;
+
+        #[test]
+        fn length_initially_zero() {
+            let (_dir, _tmp, file) = new_tmp();
+
+            unsafe {
+                let len = file.length(MID).expect("length must work");
+
+                assert_eq!(len, 0);
+                assert!(file.close(MID).check_ok());
+            }
+        }
+
+        #[test]
+        fn grow_increases_length() {
+            let (_dir, _tmp, file) = new_tmp();
+
+            unsafe {
+                let curr = file.length(MID).expect("length must work");
+                file.grow(curr, 0x400, MID).expect("grow must work");
+
+                let new_len = file.length(MID).expect("length after grow");
+                assert_eq!(new_len, curr + 0x400);
+
+                assert!(file.close(MID).check_ok());
+            }
+        }
+
+        #[test]
+        fn grow_multiple_times() {
+            let (_dir, _tmp, file) = new_tmp();
+
+            unsafe {
+                let mut total = 0;
+                for _ in 0..4 {
+                    file.grow(total, 0x100, MID).expect("grow step");
+                    total += 0x100;
+                }
+
+                let len = file.length(MID).expect("length after grows");
+                assert_eq!(len, total);
+
+                assert!(file.close(MID).check_ok());
+            }
+        }
+    }
+
+    mod file_sync {
+        use super::*;
+
+        #[test]
+        fn sync_works() {
+            let (_dir, _tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.sync(MID).check_ok());
+                assert!(file.close(MID).check_ok());
+            }
+        }
+
+        #[test]
+        fn file_sync_for_file_at_current_dir() {
+            let dir = tempdir().expect("temp dir");
+
+            let old = std::env::current_dir().expect("cwd");
+            std::env::set_current_dir(dir.path()).expect("set cwd");
+
+            let rel = path::PathBuf::from("rel_file");
+            let file = unsafe { POSIXFile::new(&rel, MID) }.expect("create relative file");
+
+            unsafe {
+                assert!(file.sync(MID).check_ok());
+                assert!(file.close(MID).check_ok());
+            }
+
+            assert!(rel.exists());
+            std::env::set_current_dir(old).expect("restore cwd");
+        }
+    }
+
+    mod file_unlink {
+        use super::*;
+
+        #[test]
+        fn unlink_removes_file() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe { assert!(file.unlink(&tmp, MID).check_ok()) };
+            assert!(!tmp.exists());
+        }
+
+        #[test]
+        fn unlink_twice_is_error() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.unlink(&tmp, MID).check_ok());
+                assert!(file.unlink(&tmp, MID).is_err());
+            }
+        }
+
+        #[test]
+        fn unlink_after_close_is_safe() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close(MID).check_ok());
+                assert!(file.unlink(&tmp, MID).check_ok());
+            }
+
+            assert!(!tmp.exists());
+        }
+    }
+
+    mod file_access_after_close {
+        use super::*;
+
+        #[test]
+        fn length_after_close_fails() {
+            let (_dir, _tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close(MID).check_ok());
+
+                let res = file.length(MID);
+                assert!(res.is_err());
+
+                let err = res.err().expect("must fail");
+                let (_, _, code) = from_err_code(err.code);
+
+                // closed fd (EBADF)
+                assert_eq!(code, FFErr::Hcf as u16);
+            }
+        }
+
+        #[test]
+        fn grow_after_close_fails() {
+            let (_dir, _tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close(MID).check_ok());
+
+                let res = file.grow(0, 0x1000, MID);
+                assert!(res.is_err());
+
+                let err = res.err().expect("must fail");
+                let (_, _, code) = from_err_code(err.code);
+
+                assert_eq!(code, FFErr::Hcf as u16);
+            }
+        }
+
+        #[test]
+        fn sync_after_close_fails() {
+            let (_dir, _tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close(MID).check_ok());
+
+                let res = file.sync(MID);
+                assert!(res.is_err());
+
+                let err = res.err().expect("must fail");
+                let (_, _, code) = from_err_code(err.code);
+
+                assert_eq!(code, FFErr::Hcf as u16);
+            }
+        }
+    }
 }

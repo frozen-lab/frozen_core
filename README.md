@@ -12,13 +12,13 @@ Custom implementations and core utilities for frozen codebases.
 
 ## FrozenFile
 
-`FF` is a custom implementation of `std::fs::File`.
+`FrozenFile` is a custom implementation of `std::fs::File`.
 
 To use the `ff` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.2", features = ["ff"] }
+frozen-core = { version = "0.0.4", features = ["ff"] }
 ```
 
 `FF` is currently available for following platforms,
@@ -29,20 +29,18 @@ frozen-core = { version = "0.0.2", features = ["ff"] }
 | `x86_64-unknown-linux-gnu`            | ✅      |
 | `aarch64-pc-windows-msvc`             | ❌      |
 | `x86_64-pc-windows-msvc`              | ❌      |
-| `aarch64-apple-darwin`                | ❌      |
-| `x86_64-apple-darwin`                 | ❌      |
-
-For Example usage, refer to [example](./examples/ff_example.rs)
+| `aarch64-apple-darwin`                | ✅      |
+| `x86_64-apple-darwin`                 | ✅      |
 
 ## FrozenMMap
 
-`FM` is a custom implementation of `mmap`.
+`FrozenMMap` is a custom implementation of `mmap`.
 
 To use the `fm` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.2", features = ["fm"] }
+frozen-core = { version = "0.0.4", features = ["fm"] }
 ```
 
 `FM` is currently available for following platforms,
@@ -53,10 +51,8 @@ frozen-core = { version = "0.0.2", features = ["fm"] }
 | `x86_64-unknown-linux-gnu`            | ✅      |
 | `aarch64-pc-windows-msvc`             | ❌      |
 | `x86_64-pc-windows-msvc`              | ❌      |
-| `aarch64-apple-darwin`                | ❌      |
-| `x86_64-apple-darwin`                 | ❌      |
-
-For Example usage, refer to [example](./examples/fm_example.rs)
+| `aarch64-apple-darwin`                | ✅      |
+| `x86_64-apple-darwin`                 | ✅      |
 
 ## FrozenError
 
@@ -66,7 +62,7 @@ The `fe` module is available by deafult. Add it as a dependency in your `Cargo.t
 
 ```toml
 [dependencies]
-frozen-core = "0.0.2"
+frozen-core = "0.0.4"
 ```
 
 ## Hints
@@ -77,7 +73,7 @@ The `hints` module is available by deafult. Add it as a dependency in your `Carg
 
 ```toml
 [dependencies]
-frozen-core = "0.0.2"
+frozen-core = "0.0.4"
 ```
 
 ## Notes
