@@ -459,7 +459,7 @@ where
 }
 
 #[cfg(test)]
-mod fm_tests {
+mod tests {
     use super::*;
     use crate::fe::{FECheckOk, MID};
     use crate::ff::{FFCfg, FrozenFile};
@@ -483,7 +483,7 @@ mod fm_tests {
         (dir, tmp, file, mmap)
     }
 
-    mod map_unmap {
+    mod mmap_new_and_unmap {
         use super::*;
 
         #[test]
@@ -502,9 +502,83 @@ mod fm_tests {
             assert!(map.munmap().check_ok());
             assert!(map.munmap().check_ok());
         }
+
+        #[test]
+        fn drop_syncs_if_dirty() {
+            let dir = tempdir().expect("tmp dir");
+            let path = dir.path().join("drop_dirty");
+
+            {
+                let file = FrozenFile::new(get_ff_cfg(path.clone()), LEN as u64).expect("new");
+                let mmap = FrozenMMap::new(file.fd(), LEN, CFG).expect("mmap");
+
+                mmap.writer::<u64>(0)
+                    .expect("writer")
+                    .write(|v| *v = 777)
+                    .expect("write");
+            }
+
+            let file = FrozenFile::open(get_ff_cfg(path)).expect("open");
+            let mmap = FrozenMMap::new(file.fd(), LEN, CFG).expect("mmap");
+
+            let r = mmap.reader::<u64>(0).expect("reader");
+            assert_eq!(r.read(|v| *v), 777);
+        }
     }
 
-    mod write_read {
+    mod mmap_auto_flush {
+        use super::*;
+
+        #[test]
+        fn auto_flush_persists_without_manual_sync() {
+            let dir = tempdir().expect("tmp dir");
+            let path = dir.path().join("auto");
+
+            let cfg = FMCfg::new(MID)
+                .enable_auto_flush()
+                .flush_duration(time::Duration::from_millis(50));
+
+            {
+                let file = FrozenFile::new(get_ff_cfg(path.clone()), LEN as u64).expect("new");
+                let mmap = FrozenMMap::new(file.fd(), LEN, cfg).expect("mmap");
+
+                mmap.writer::<u64>(0)
+                    .expect("writer")
+                    .write(|v| *v = 99)
+                    .expect("write");
+
+                thread::sleep(time::Duration::from_millis(200));
+            }
+
+            {
+                let file = FrozenFile::open(get_ff_cfg(path)).expect("open");
+                let mmap = FrozenMMap::new(file.fd(), LEN, CFG).expect("mmap");
+                let r = mmap.reader::<u64>(0).expect("reader");
+                assert_eq!(r.read(|v| *v), 99);
+            }
+        }
+
+        #[test]
+        fn auto_flush_clears_dirty_flag() {
+            let (_dir, _tmp, _file, mmap) = {
+                let cfg = FMCfg::new(MID)
+                    .enable_auto_flush()
+                    .flush_duration(time::Duration::from_millis(50));
+                let (d, p, f, _) = new_tmp();
+                let mmap = FrozenMMap::new(f.fd(), LEN, cfg).expect("mmap");
+                (d, p, f, mmap)
+            };
+
+            mmap.writer::<u64>(0).expect("writer").write(|v| *v = 1).expect("write");
+
+            thread::sleep(time::Duration::from_millis(150));
+
+            // should not panic or error
+            assert!(mmap.sync().check_ok());
+        }
+    }
+
+    mod mmap_write_read {
         use super::*;
 
         #[test]
@@ -566,9 +640,31 @@ mod fm_tests {
             let bytes: [u8; 8] = buf[0..8].try_into().expect("Slice with incorrect length");
             assert_eq!(u64::from_le_bytes(bytes), 0xCAFEBABECAFEBABE);
         }
+
+        #[test]
+        fn many_readers_increment_active_safely() {
+            let (_dir, _tmp, _file, mmap) = new_tmp();
+            let mmap = sync::Arc::new(mmap);
+
+            let mut handles = Vec::new();
+
+            for _ in 0..0x20 {
+                let m = mmap.clone();
+                handles.push(thread::spawn(move || {
+                    let r = m.reader::<u64>(0).expect("reader");
+                    r.read(|_| {});
+                }));
+            }
+
+            for h in handles {
+                h.join().expect("join");
+            }
+
+            assert!(mmap.sync().check_ok());
+        }
     }
 
-    mod concurrency {
+    mod mmap_concurrency {
         use super::*;
 
         #[test]
