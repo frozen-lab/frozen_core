@@ -325,8 +325,11 @@ mod tests {
             }
         }
 
+        /// this is linux only test, as on macos, the `fnctl` does not care about mapping, we use
+        /// the files `fd` to perform the sync
         #[test]
-        fn sync_after_unmap_should_fail_or_noop() {
+        #[cfg(target_os = "linux")]
+        fn sync_after_unmap_should_fail() {
             let (_dir, _tmp, file, map) = new_tmp();
 
             unsafe {
