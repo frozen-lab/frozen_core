@@ -3,22 +3,28 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod posix;
 
-use crate::fe::{FErr, FRes};
-use std::{
-    cell, fmt, mem, path,
-    sync::{self, atomic},
-};
-
-/// Domain Id for [`FrozenFile`] is **17**
-const ERRDOMAIN: u8 = 0x11;
+use crate::error::{FrozenErr, FrozenRes};
+use alloc::{sync::Arc, vec::Vec};
+use core::{cell, fmt, mem, sync::atomic};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 type FFile = posix::POSIXFile;
 
+/// Domain Id for [`FrozenFile`] is **17**
+const ERRDOMAIN: u8 = 0x11;
+
+/// module id used for [`FrozenErr`]
+static MID: atomic::AtomicU8 = atomic::AtomicU8::new(0);
+
+#[inline]
+pub(in crate::ffile) fn mid() -> u8 {
+    MID.load(atomic::Ordering::Relaxed)
+}
+
 /// Error codes for [`FrozenFile`]
 #[repr(u16)]
-pub enum FFErr {
-    /// (256) internal fuck up
+pub enum FFileErrCtx {
+    /// (256) internal fuck up (hault and catch fire)
     Hcf = 0x100,
 
     /// (257) unknown error (fallback)
@@ -38,44 +44,19 @@ pub enum FFErr {
 
     /// (262) invalid path
     Inv = 0x106,
+
+    /// (263) corrupted file
+    Cpt = 0x107,
 }
 
 #[inline]
-pub(in crate::ff) fn new_error<E, R>(mid: u8, reason: FFErr, error: E) -> FRes<R>
-where
-    E: fmt::Display,
-{
-    let code = crate::fe::new_err_code(mid, ERRDOMAIN, reason as u16);
-    let err = FErr::with_err(code, error);
+pub(in crate::ffile) fn new_err<R>(ctx: FFileErrCtx, message: alloc::vec::Vec<u8>) -> FrozenRes<R> {
+    let err = FrozenErr::new(mid(), ERRDOMAIN, ctx as u16, message);
     Err(err)
 }
 
-/// Config for [`FrozenFile`]
-#[derive(Clone)]
-pub struct FFCfg {
-    /// module id for [`FrozenFile`]
-    ///
-    /// This id is used for error codes
-    ///
-    /// ## Why
-    ///
-    /// It enables for easier identification of error boundries when multiple [`FM`]
-    /// modules are present in the codebase
-    pub module_id: u8,
-
-    /// Path of the file
-    pub path: path::PathBuf,
-}
-
-impl FFCfg {
-    /// Create a new instance of [`FFCfg`] w/ specified `module_id`
-    pub const fn new(path: path::PathBuf, module_id: u8) -> Self {
-        Self { path, module_id }
-    }
-}
-
-/// Custom implementation of File
-pub struct FrozenFile(sync::Arc<Core>);
+/// Custom implementation of `std::fs::File`
+pub struct FrozenFile(Arc<Core>);
 
 unsafe impl Send for FrozenFile {}
 unsafe impl Sync for FrozenFile {}
@@ -94,53 +75,53 @@ impl FrozenFile {
         self.get_file().fd()
     }
 
-    /// Create new [`FrozenFile`] w/ specified length
-    pub fn new(cfg: FFCfg, length: u64) -> FRes<Self> {
-        let file = unsafe { posix::POSIXFile::new(&cfg.path, cfg.module_id) }?;
-        let core = sync::Arc::new(Core::new(file, cfg.clone(), length));
+    /// Create/open new instance of [`FrozenFile`]
+    pub fn new(path: Vec<u8>, init_len: u64, mid: u8) -> FrozenRes<Self> {
+        MID.store(mid, atomic::Ordering::Relaxed);
 
-        let ff = Self(core.clone());
-        if let Err(e) = ff.grow(length) {
-            // NOTE: we delete the file so new init could work w/o any errors
-            // HACK: we ignore the delete error, cause we already in errored state
-            let _ = ff.delete();
-            return Err(e);
+        let file = unsafe { posix::POSIXFile::new(&path) }?;
+        let curr_len = unsafe { file.length()? };
+
+        // TODO: (in future) improve corruption handling for file
+
+        match curr_len {
+            0 => unsafe { file.grow(0, init_len)? },
+            _ => {
+                if curr_len < init_len {
+                    return new_err(
+                        FFileErrCtx::Cpt,
+                        b"underlying file is either corrupted or tampered with".to_vec(),
+                    );
+                }
+            }
         }
 
-        Ok(ff)
-    }
-
-    /// Open an existing [`FrozenFile`]
-    pub fn open(cfg: FFCfg) -> FRes<Self> {
-        let file = unsafe { posix::POSIXFile::open(&cfg.path, cfg.module_id) }?;
-        let length = unsafe { file.length(cfg.module_id) }?;
-        let core = sync::Arc::new(Core::new(file, cfg.clone(), length));
-        Ok(Self(core.clone()))
+        let core = Arc::new(Core::new(file, curr_len.max(init_len), path));
+        Ok(Self(core))
     }
 
     /// Grow [`FrozenFile`] w/ given `len_to_add`
     #[inline(always)]
-    pub fn grow(&self, len_to_add: u64) -> FRes<()> {
-        unsafe { self.get_file().grow(self.length(), len_to_add, self.0.cfg.module_id) }.inspect(|_| {
+    pub fn grow(&self, len_to_add: u64) -> FrozenRes<()> {
+        unsafe { self.get_file().grow(self.length(), len_to_add) }.inspect(|_| {
             let _ = self.0.length.fetch_add(len_to_add, atomic::Ordering::Release);
         })
     }
 
     /// Syncs in-mem data on the storage device
     #[inline]
-    pub fn sync(&self) -> FRes<()> {
+    pub fn sync(&self) -> FrozenRes<()> {
         self.0.sync()
     }
 
     /// Delete [`FrozenFile`] from filesystem
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub fn delete(&self) -> FRes<()> {
+    pub fn delete(&self) -> FrozenRes<()> {
         let file = self.get_file();
 
         // NOTE: sanity check is invalid here, cause we are deleting the file, hence we don't
         // actually care if the state is sane or not ;)
 
-        unsafe { file.unlink(&self.0.cfg.path, self.0.cfg.module_id) }
+        unsafe { file.unlink(&self.0.path) }
     }
 
     #[inline]
@@ -153,7 +134,7 @@ impl Drop for FrozenFile {
     fn drop(&mut self) {
         // sync if dirty & close
         let _ = self.0.sync();
-        let _ = unsafe { self.get_file().close(self.0.cfg.module_id) };
+        let _ = unsafe { self.get_file().close() };
     }
 }
 
@@ -164,13 +145,13 @@ impl fmt::Display for FrozenFile {
             "FrozenFile {{fd: {}, len: {}, id: {}}}",
             self.fd(),
             self.length(),
-            self.0.cfg.module_id,
+            mid()
         )
     }
 }
 
 struct Core {
-    cfg: FFCfg,
+    path: Vec<u8>,
     length: atomic::AtomicU64,
     file: cell::UnsafeCell<mem::ManuallyDrop<FFile>>,
 }
@@ -179,9 +160,9 @@ unsafe impl Send for Core {}
 unsafe impl Sync for Core {}
 
 impl Core {
-    fn new(file: FFile, cfg: FFCfg, length: u64) -> Self {
+    fn new(file: FFile, length: u64, path: Vec<u8>) -> Self {
         Self {
-            cfg,
+            path,
             length: atomic::AtomicU64::new(length),
             file: cell::UnsafeCell::new(mem::ManuallyDrop::new(file)),
         }
@@ -189,7 +170,123 @@ impl Core {
 
     #[inline]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn sync(&self) -> FRes<()> {
-        unsafe { (&*self.file.get()).sync(self.cfg.module_id) }
+    fn sync(&self) -> FrozenRes<()> {
+        unsafe { (&*self.file.get()).sync() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::TEST_MID;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    fn tmp_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("db_file");
+        (dir, path)
+    }
+
+    mod ffile_new {
+        use super::*;
+
+        #[test]
+        fn new_creates_and_initializes_length() {
+            let (_dir, path) = tmp_path();
+
+            let ff = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x800, TEST_MID).expect("create db");
+
+            assert_eq!(ff.length(), 0x800);
+            assert!(path.exists());
+        }
+
+        #[test]
+        fn reopen_existing_preserves_length() {
+            let (_dir, path) = tmp_path();
+
+            let ff1 = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x400, TEST_MID).expect("create db");
+
+            assert_eq!(ff1.length(), 0x400);
+            drop(ff1);
+
+            let ff2 = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x400, TEST_MID).expect("reopen db");
+            assert_eq!(ff2.length(), 0x400);
+        }
+
+        #[test]
+        fn reopening_with_smaller_init_len_is_ok() {
+            let (_dir, path) = tmp_path();
+
+            let ff1 = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x1000, TEST_MID).expect("create db");
+            drop(ff1);
+
+            let ff2 = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x200, TEST_MID).expect("reopen db");
+            assert_eq!(ff2.length(), 0x1000);
+        }
+
+        #[test]
+        fn reopening_with_larger_init_len_detects_corruption() {
+            let (_dir, path) = tmp_path();
+
+            let ff1 = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x400, TEST_MID).expect("create db");
+            drop(ff1);
+
+            let res = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x800, TEST_MID);
+            assert!(res.is_err());
+
+            let err = res.err().expect("must fail");
+            assert!(err.cmp(FFileErrCtx::Cpt as u16));
+        }
+
+        #[test]
+        fn new_fails_on_missing_parent_directory() {
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("missing").join("db_file");
+            let res = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x200, TEST_MID);
+
+            assert!(res.is_err());
+        }
+    }
+
+    mod ffile_grow {
+        use super::*;
+
+        #[test]
+        fn grow_updates_length_correctly() {
+            let (_dir, path) = tmp_path();
+
+            let ff = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x200, TEST_MID).expect("create db");
+            ff.grow(0x300).expect("grow");
+
+            assert_eq!(ff.length(), 0x500);
+        }
+    }
+
+    mod ffile_delete {
+        use super::*;
+
+        #[test]
+        fn delete_removes_file() {
+            let (_dir, path) = tmp_path();
+
+            let ff = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x200, TEST_MID).expect("create db");
+            ff.delete().expect("delete");
+
+            assert!(!path.exists());
+        }
+
+        #[test]
+        fn drop_sync_and_close_is_safe() {
+            let (_dir, path) = tmp_path();
+
+            {
+                let ff = FrozenFile::new(path.as_os_str().as_bytes().to_vec(), 0x300, TEST_MID).expect("create db");
+                assert_eq!(ff.length(), 0x300);
+            }
+
+            assert!(path.exists());
+        }
     }
 }
