@@ -3,8 +3,9 @@ use crate::{error::FrozenRes, hints};
 use alloc::{ffi::CString, vec::Vec};
 use core::{ffi::CStr, sync::atomic};
 use libc::{
-    access, c_int, c_uint, close, fstat, ftruncate, off_t, open, stat, unlink, EACCES, EBADF, EFAULT, EINTR, EINVAL,
-    EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS, F_OK, O_CLOEXEC, O_CREAT, O_RDWR, S_IRUSR, S_IWUSR,
+    access, c_char, c_int, c_uint, c_void, close, fstat, ftruncate, off_t, open, pread, pwrite, size_t, stat, unlink,
+    EACCES, EBADF, EFAULT, EINTR, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS, ESPIPE, F_OK, O_CLOEXEC,
+    O_CREAT, O_RDWR, S_IRUSR, S_IWUSR,
 };
 
 /// type for file descriptor on POSIX systems
@@ -249,6 +250,82 @@ impl POSIXFile {
     #[cfg(target_os = "linux")]
     pub(super) unsafe fn sync(&self) -> FrozenRes<()> {
         fdatasync_raw(self.fd())
+    }
+
+    /// Read at given `offset` w/ `pread` syscall from [`POSIXFile`]
+    #[inline(always)]
+    pub(super) unsafe fn pread(&self, buf_ptr: *mut u8, offset: usize, len_to_read: usize) -> FrozenRes<()> {
+        let mut read = 0usize;
+        while read < len_to_read {
+            let res = pread(
+                self.fd(),
+                buf_ptr.add(read) as *mut c_void,
+                (len_to_read - read) as libc::size_t,
+                (offset + read) as i64,
+            );
+
+            if hints::unlikely(res <= 0) {
+                let errno = last_errno();
+                let err_msg = err_msg(errno);
+
+                match errno {
+                    // unexpected EOF
+                    0 => return new_err(FFileErrRes::Eof, err_msg),
+
+                    // io interrupt
+                    EINTR => continue,
+
+                    EACCES | EPERM => return new_err(FFileErrRes::Red, err_msg),
+
+                    // invalid fd, invalid fd type, bad pointer, etc.
+                    EINVAL | EBADF | EFAULT | ESPIPE => return new_err(FFileErrRes::Hcf, err_msg),
+
+                    _ => return new_err(FFileErrRes::Unk, err_msg),
+                }
+            }
+
+            read += res as usize;
+        }
+
+        Ok(())
+    }
+
+    /// Write at given `offset` w/ `pwrite` syscall to [`POSIXFile`]
+    #[inline(always)]
+    pub(super) unsafe fn pwrite(&self, buf_ptr: *const u8, offset: usize, len_to_write: usize) -> FrozenRes<()> {
+        let mut written = 0usize;
+        while written < len_to_write {
+            let res = pwrite(
+                self.fd(),
+                buf_ptr.add(written) as *const c_void,
+                (len_to_write - written) as size_t,
+                (offset + written) as i64,
+            );
+
+            if hints::unlikely(res <= 0) {
+                let errno = last_errno();
+                let err_msg = err_msg(errno);
+
+                match errno {
+                    // unexpected EOF
+                    0 => return new_err(FFileErrRes::Eof, err_msg),
+
+                    // io interrupt
+                    EINTR => continue,
+
+                    EACCES | EPERM => return new_err(FFileErrRes::Red, err_msg),
+
+                    // invalid fd, invalid fd type, bad pointer, etc.
+                    EINVAL | EBADF | EFAULT | ESPIPE => return new_err(FFileErrRes::Hcf, err_msg),
+
+                    _ => return new_err(FFileErrRes::Unk, err_msg),
+                }
+            }
+
+            written += res as usize;
+        }
+
+        Ok(())
     }
 }
 
@@ -584,7 +661,7 @@ fn last_errno() -> i32 {
 #[inline]
 unsafe fn err_msg(errno: i32) -> Vec<u8> {
     const BUF_LEN: usize = 0x100;
-    let mut buf = [0i8; BUF_LEN];
+    let mut buf = [c_char::default(); BUF_LEN];
 
     if libc::strerror_r(errno, buf.as_mut_ptr(), BUF_LEN) != 0 {
         return Vec::new();

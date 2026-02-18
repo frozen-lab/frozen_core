@@ -47,6 +47,9 @@ pub enum FFileErrRes {
 
     /// (263) corrupted file
     Cpt = 0x107,
+
+    /// (264) unexpected eof
+    Eof = 0x108,
 }
 
 impl FFileErrRes {
@@ -58,6 +61,7 @@ impl FFileErrRes {
             Self::Hcf => b"hault and catch fire",
             Self::Red => b"read permission denied",
             Self::Wrt => b"write permission denied",
+            Self::Eof => b"unxpected eof while io op",
             Self::Nsp => b"no space left on storage device",
             Self::Cpt => b"file is either invalid or corrupted",
             Self::Syn => b"failed to sync/flush data to storage device",
@@ -150,6 +154,20 @@ impl FrozenFile {
         // actually care if the state is sane or not ;)
 
         unsafe { file.unlink(&self.0.path) }
+    }
+
+    /// Read at given `offset` from [`FrozenFile`]
+    #[inline(always)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn read(&self, buf_ptr: *mut u8, offset: usize, len_to_read: usize) -> FrozenRes<()> {
+        unsafe { self.get_file().pread(buf_ptr, offset, len_to_read) }
+    }
+
+    /// Write at given `offset` into [`FrozenFile`]
+    #[inline(always)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn write(&self, buf_ptr: *const u8, offset: usize, len_to_write: usize) -> FrozenRes<()> {
+        unsafe { self.get_file().pwrite(buf_ptr, offset, len_to_write) }
     }
 
     #[inline]
