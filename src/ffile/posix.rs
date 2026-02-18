@@ -3,8 +3,8 @@ use crate::{error::FrozenRes, hints};
 use alloc::{ffi::CString, vec::Vec};
 use core::{ffi::CStr, sync::atomic};
 use libc::{
-    access, c_char, c_int, c_uint, close, fstat, ftruncate, off_t, open, stat, unlink, EACCES, EBADF, EFAULT, EINTR,
-    EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS, F_OK, O_CLOEXEC, O_CREAT, O_RDWR, S_IRUSR, S_IWUSR,
+    access, c_int, c_uint, close, fstat, ftruncate, off_t, open, stat, unlink, EACCES, EBADF, EFAULT, EINTR, EINVAL,
+    EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, EPERM, EROFS, F_OK, O_CLOEXEC, O_CREAT, O_RDWR, S_IRUSR, S_IWUSR,
 };
 
 /// type for file descriptor on POSIX systems
@@ -35,8 +35,8 @@ impl POSIXFile {
     /// calling process can resolve the path in the filesystem
     #[inline]
     pub(super) unsafe fn exists(path: &[u8]) -> FrozenRes<bool> {
-        let path = path_to_cstring(path)?;
-        Ok(access(path, F_OK) == 0)
+        let cpath = path_to_cstring(path)?;
+        Ok(access(cpath.as_ptr(), F_OK) == 0)
     }
 
     /// create a new [`POSIXFile`]
@@ -87,7 +87,7 @@ impl POSIXFile {
         // NOTE: POSIX systems requires fd to be closed before attempting to unlink the file
         self.close()?;
 
-        if unlink(cpath) == 0 {
+        if unlink(cpath.as_ptr()) == 0 {
             return Ok(());
         }
 
@@ -275,12 +275,12 @@ unsafe fn open_raw(path: &[u8], flags: FD) -> FrozenRes<FD> {
     loop {
         let fd = if flags & O_CREAT != 0 {
             open(
-                cpath,
+                cpath.as_ptr(),
                 flags,
                 (S_IRUSR | S_IWUSR) as c_uint, // write + read permissions
             )
         } else {
-            open(cpath, flags)
+            open(cpath.as_ptr(), flags)
         };
 
         if hints::unlikely(fd < 0) {
@@ -561,13 +561,11 @@ const fn prep_flags() -> FD {
     return O_RDWR | O_CLOEXEC | O_CREAT;
 }
 
-fn path_to_cstring(path: &[u8]) -> FrozenRes<*const c_char> {
-    let cstr = match CString::new(path) {
+fn path_to_cstring(path: &[u8]) -> FrozenRes<CString> {
+    match CString::new(path) {
         Ok(cs) => Ok(cs),
         Err(e) => new_err(FFileErrRes::Inv, e.into_vec()),
-    }?;
-
-    Ok(cstr.as_ptr())
+    }
 }
 
 #[inline]
@@ -594,4 +592,152 @@ unsafe fn err_msg(errno: i32) -> Vec<u8> {
 
     let cstr = CStr::from_ptr(buf.as_ptr());
     return cstr.to_bytes().to_vec();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_tmp(id: &'static [u8]) -> (Vec<u8>, POSIXFile) {
+        let mut path = Vec::with_capacity(b"./target/".len() + id.len());
+        path.extend_from_slice(b"./target/");
+        path.extend_from_slice(id);
+
+        let file = unsafe { POSIXFile::new(&path).expect("new POSIXFile") };
+
+        (path, file)
+    }
+
+    mod posix_new {
+        use super::*;
+
+        #[test]
+        fn new_create_a_file() {
+            let (path, file) = new_tmp(b"ffile_new");
+            assert!(file.fd() >= 0);
+
+            unsafe { file.unlink(&path) }.expect("unlink file");
+        }
+
+        #[test]
+        fn new_opens_existing_file() {
+            let (path, file) = new_tmp(b"ffile_open");
+
+            assert!(file.fd() >= 0);
+            unsafe { file.close() }.expect("close file");
+
+            unsafe {
+                match POSIXFile::new(&path) {
+                    Ok(file) => {
+                        assert!(file.fd() >= 0);
+                        file.unlink(&path).expect("unlink file");
+                    }
+                    Err(e) => panic!("failed to open file due to E: {:?}", e),
+                }
+            }
+        }
+
+        #[test]
+        fn new_creates_file_with_len_zero() {
+            let (path, file) = new_tmp(b"ffile_new_len");
+            assert!(file.fd() >= 0);
+
+            unsafe {
+                assert_eq!(file.length().expect("read len"), 0);
+                file.unlink(&path).expect("unlink file");
+            }
+        }
+
+        #[test]
+        fn new_preserves_existing_len() {
+            const LEN: u64 = 0x100;
+            let (path, file) = new_tmp(b"ffile_open_len");
+
+            unsafe {
+                file.grow(0, LEN).expect("grow");
+                file.close().expect("close file");
+            }
+
+            let file2 = unsafe { POSIXFile::new(&path) }.expect("open existing");
+            unsafe {
+                let len = file2.length().expect("length");
+                assert_eq!(len, LEN);
+                file2.unlink(&path).expect("unlink file");
+            }
+        }
+
+        #[test]
+        fn new_fails_on_dirpath() {
+            unsafe { POSIXFile::new(b"./target/") }.expect_err("must fail");
+        }
+    }
+
+    mod posix_close_unlink {
+        use super::*;
+
+        #[test]
+        fn close_works() {
+            let (path, file) = new_tmp(b"ffile_close_works");
+
+            unsafe {
+                file.close().expect("close file");
+                assert_eq!(file.fd(), CLOSED_FD);
+                file.unlink(&path).expect("unlink file");
+            }
+        }
+
+        #[test]
+        fn unlink_works() {
+            let (path, file) = new_tmp(b"ffile_unlink_works");
+
+            unsafe {
+                file.unlink(&path).expect("unlink file");
+                assert_eq!(file.fd(), CLOSED_FD);
+
+                let exists = POSIXFile::exists(&path).expect("check exists");
+                assert!(!exists);
+            }
+        }
+    }
+
+    mod posix_length_grow {
+        use super::*;
+
+        #[test]
+        fn grow_works() {
+            let (path, file) = new_tmp(b"ffile_grow_works");
+
+            unsafe {
+                file.grow(0, 0x80).expect("grow");
+                file.unlink(&path).expect("unlink file");
+            }
+        }
+
+        #[test]
+        fn grow_updates_length() {
+            let (path, file) = new_tmp(b"ffile_grow_length");
+
+            unsafe {
+                file.grow(0, 0x80).expect("grow");
+                assert_eq!(file.length().expect("read len"), 0x80);
+                file.unlink(&path).expect("unlink file");
+            }
+        }
+
+        #[test]
+        fn grow_after_grow() {
+            let (path, file) = new_tmp(b"ffile_grow_after_grow");
+
+            unsafe {
+                let mut total = 0;
+                for _ in 0..4 {
+                    file.grow(total, 0x100).expect("grow step");
+                    total += 0x100;
+                }
+
+                assert_eq!(file.length().expect("read len"), total);
+                file.unlink(&path).expect("unlink file");
+            }
+        }
+    }
 }

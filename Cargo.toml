@@ -14,20 +14,10 @@ error = []
 hints = []
 ffile = ["libc", "error", "hints"]
 fmmap = ["libc", "error", "hints"]
+default = ["error", "hints", "ffile", "fmmap"]
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.178", optional = true }
 
-[dev-dependencies]
-tempfile = "3.20.0"
-
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2.178"
-
-[[example]]
-name = "ff"
-required-features = ["ffile"]
-
-[[example]]
-name = "fm"
-required-features = ["ffile", "fmmap"]
