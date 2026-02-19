@@ -8,8 +8,8 @@ on:
     branches: ["master"]
 
 jobs:
-  linux:
-    name: Linux
+  linux-tests:
+    name: Linux Tests
     strategy:
       fail-fast: false
       matrix:
@@ -33,8 +33,45 @@ jobs:
           key: linux-${{ matrix.arch }}
       - run: cargo test --release -- --nocapture
 
-  macos:
-    name: MacOS
+  linux-examples:
+    name: Linux Examples
+    needs: linux-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-22.04
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+          - os: ubuntu-22.04-arm
+            arch: aarch64
+        example:
+          - ff
+          - fm
+    runs-on: ${{ matrix.platform.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: examples-${{ matrix.platform.arch }}
+          cache-on-failure: true
+
+      - name: Run example
+        run: cargo run --release --example ${{ matrix.example }}
+
+  macos-tests:
+    name: MacOS Tests
     strategy:
       fail-fast: false
       matrix:
@@ -55,3 +92,38 @@ jobs:
         with:
           key: macos-${{ matrix.arch }}
       - run: cargo test --release -- --nocapture
+
+  macos-examples:
+    name: MacOS Examples
+    needs: macos-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-14
+            arch: aarch64
+          - os: macos-latest
+            arch: aarch64
+        example:
+          - ff
+          - fm
+    runs-on: ${{ matrix.platform.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: examples-${{ matrix.platform.arch }}
+          cache-on-failure: true
+
+      - name: Run example
+        run: cargo run --release --example ${{ matrix.example }}

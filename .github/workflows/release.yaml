@@ -15,10 +15,17 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - os: ubuntu-latest
-            arch: x86_64
           - os: ubuntu-24.04-arm
             arch: aarch64
+          - os: macos-15-intel
+            arch: x86_64
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: macos-latest
+            arch: aarch64
+        example:
+          - ff
+          - fm
     runs-on: ${{ matrix.platform.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,12 +41,9 @@ jobs:
           key: examples-${{ matrix.platform.arch }}
           cache-on-failure: true
 
-      - name: Run ff example
-        run: cargo run --release --example ff --features="ff"
-
-      - name: Run fm example
-        run: cargo run --release --example fm --features="ff, fm"
-
+      - name: Run example
+        run: cargo run --release --example ${{ matrix.example }}
+  
   release:
     needs: examples
     runs-on: ubuntu-latest
