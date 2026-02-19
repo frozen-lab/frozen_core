@@ -5,7 +5,6 @@ version = "0.0.5"
 exclude = ["shell.nix"]
 license = "MIT OR Apache-2.0"
 keywords = ["frozen-lab", "frozen-core"]
-categories = ["no-std"]
 repository = "https://github.com/frozen-lab/frozen-core"
 description = "Custom implementations and core utilities for frozen codebases"
 

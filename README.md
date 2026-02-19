@@ -4,24 +4,37 @@ Custom implementations and core utilities for frozen codebases.
 
 ## Index
 
-- [`ff`](#frozenfile)
-- [`fm`](#frozenmmap)
-- [`fe`](#frozenerror)
+- [`setup`](#setup)
+- [`ffile`](#frozenfile)
+- [`fmmap`](#frozenmmap)
+- [`error`](#frozenerr)
 - [`hints`](#hints)
 - [`notes`](#notes)
+
+## Setup
+
+Add following to your `Cargo.toml`,
+
+```toml
+[dependencies]
+frozen-core = { version = "0.0", default-features = true }
+```
+
+> [!TIP]
+> All the features available by default. To disable this, set `default-features = false`
 
 ## FrozenFile
 
 `FrozenFile` is a custom implementation of `std::fs::File`.
 
-To use the `ff` module, add it as a dependency in your `Cargo.toml`:
+To use the `ffile` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.4", features = ["ff"] }
+frozen-core = { version = "0.0", default-features = false, features = ["ffile"] }
 ```
 
-`FF` is currently available for following platforms,
+`FrozenFile` is currently available on the following platforms,
 
 | Platform                              | Support |
 |---------------------------------------|:-------:|
@@ -32,20 +45,20 @@ frozen-core = { version = "0.0.4", features = ["ff"] }
 | `aarch64-apple-darwin`                | ✅      |
 | `x86_64-apple-darwin`                 | ✅      |
 
-For Example usage, refer to [example](./examples/ff.rs)
+For example usage, refer to [example](./examples/ff.rs)
 
 ## FrozenMMap
 
 `FrozenMMap` is a custom implementation of `mmap`.
 
-To use the `fm` module, add it as a dependency in your `Cargo.toml`:
+To use the `fmmap` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.4", features = ["fm"] }
+frozen-core = { version = "0.0", default-features = false, features = ["fmmap"] }
 ```
 
-`FM` is currently available for following platforms,
+`FrozenMMap` is currently available on the following platforms,
 
 | Platform                              | Support |
 |---------------------------------------|:-------:|
@@ -56,28 +69,28 @@ frozen-core = { version = "0.0.4", features = ["fm"] }
 | `aarch64-apple-darwin`                | ✅      |
 | `x86_64-apple-darwin`                 | ✅      |
 
-For Example usage, refer to [example](./examples/fm.rs)
+For example usage, refer to [example](./examples/fm.rs)
 
-## FrozenError
+## FrozenErr
 
 `FRes` & `FErr` are custom implementation's for result and error propogation.
 
-The `fe` module is available by deafult. Add it as a dependency in your `Cargo.toml`:
+To use the `error` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = "0.0.4"
+frozen-core = { version = "0.0", default-features = false, features = ["error"] }
 ```
 
 ## Hints
 
 The `hints` module provides stable friendly implementations of `likely` and `unlikely` branch hints functions.
 
-The `hints` module is available by deafult. Add it as a dependency in your `Cargo.toml`:
+To use the `hints` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = "0.0.4"
+frozen-core = { version = "0.0", default-features = false, features = ["hints"] }
 ```
 
 ## Notes

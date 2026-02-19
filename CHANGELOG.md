@@ -1,5 +1,11 @@
 # Changelog
 
+## `0.0.5`
+
+- improved error propogation
+- all modules are behind feature flags (all available by default)
+- failed attempt to go `no_std`
+
 ## `0.0.4`
 
 - `FF` module
