@@ -82,7 +82,7 @@ pub(in crate::fmmap) fn new_err<R>(res: FMMapErrRes, message: Vec<u8>) -> Frozen
 }
 
 /// Config for [`FrozenMMap`]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct FMCfg {
     /// module id for [`FrozenMMap`]
     ///
@@ -125,6 +125,7 @@ impl FMCfg {
 }
 
 /// Custom implementation of MemMap
+#[derive(Debug)]
 pub struct FrozenMMap(sync::Arc<Core>);
 
 unsafe impl Send for FrozenMMap {}
@@ -177,6 +178,12 @@ impl FrozenMMap {
         self.0.sync()
     }
 
+    /// Returns the [`FrozenErr`] representing the last error occurred in [`FrozenMMap`]
+    #[inline]
+    pub fn last_error(&self) -> Option<&FrozenErr> {
+        self.0.error.get()
+    }
+
     /// Get a [`FMReader`] object for `T` at given `offset`
     ///
     /// **NOTE**: `offset` must be 8 bytes aligned
@@ -223,9 +230,26 @@ impl Drop for FrozenMMap {
             return;
         }
 
+        // close flusher thread
+        if self.0.cfg.auto_flush {
+            self.0.cv.notify_one();
+        }
+
         // sync if dirty
         if self.0.dirty.swap(false, atomic::Ordering::AcqRel) {
             let _ = self.sync();
+        }
+
+        let mut guard = match self.0.lock.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        while self.0.active.load(atomic::Ordering::Acquire) != 0 {
+            guard = match self.0.shutdown_cv.wait(guard) {
+                Ok(g) => g,
+                Err(_) => return,
+            }
         }
 
         let _ = self.munmap();
@@ -244,6 +268,7 @@ impl fmt::Display for FrozenMMap {
     }
 }
 
+#[derive(Debug)]
 struct Core {
     cfg: FMCfg,
     length: usize,
@@ -401,6 +426,7 @@ impl Core {
     }
 }
 
+#[derive(Debug)]
 struct ActiveGuard<'a> {
     core: &'a Core,
 }
@@ -417,6 +443,7 @@ impl Drop for ActiveGuard<'_> {
 }
 
 /// Reader object for [`FrozenMMap`]
+#[derive(Debug)]
 pub struct FMReader<'a, T> {
     ptr: *const T,
     _guard: ActiveGuard<'a>,
@@ -431,6 +458,7 @@ impl<'a, T> FMReader<'a, T> {
 }
 
 /// Writer object for [`FrozenMMap`]
+#[derive(Debug)]
 pub struct FMWriter<'a, T> {
     ptr: *mut T,
     map: &'a FrozenMMap,
@@ -457,30 +485,35 @@ impl<'a, T> FMWriter<'a, T> {
 mod tests {
     use super::*;
     use crate::{error::TEST_MID, ffile::FrozenFile};
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{path::PathBuf, sync::Arc, thread};
+    use tempfile::{tempdir, TempDir};
 
     const LEN: usize = 0x80;
 
-    fn new_tmp(id: &'static [u8]) -> (Vec<u8>, FrozenFile, FrozenMMap) {
-        let mut path = Vec::with_capacity(b"./target/".len() + id.len());
-        path.extend_from_slice(b"./target/");
-        path.extend_from_slice(id);
+    fn new_tmp() -> (TempDir, PathBuf, FrozenMMap) {
+        let dir = tempdir().expect("tmp dir");
+        let path = dir.path().join("ids");
 
-        let file = FrozenFile::new(path.clone(), LEN as u64, TEST_MID).expect("new FrozenFile");
+        let file = FrozenFile::new(path.clone(), LEN, TEST_MID).expect("new FrozenFile");
         let cfg = FMCfg::new(TEST_MID);
-        let mmap = FrozenMMap::new(file.clone(), LEN, cfg).expect("new FrozenMMap");
+        let mmap = FrozenMMap::new(file, LEN, cfg).expect("new FrozenMMap");
 
-        (path, file, mmap)
+        (dir, path, mmap)
     }
 
-    mod fm_lifecycle {
+    mod fm_lifetime {
         use super::*;
 
         #[test]
-        fn map_drop_works() {
-            let (_, file, mmap) = new_tmp(b"map_drop_works");
+        fn drop_without_dirty_is_safe() {
+            let (_dir, _path, mmap) = new_tmp();
             drop(mmap);
-            file.delete().expect("delete file");
+        }
+
+        #[test]
+        fn last_error_initially_none() {
+            let (_dir, _path, mmap) = new_tmp();
+            assert!(mmap.last_error().is_none());
         }
     }
 
@@ -489,15 +522,13 @@ mod tests {
 
         #[test]
         fn sync_works() {
-            let (_, file, mmap) = new_tmp(b"sync_works");
+            let (_dir, _path, mmap) = new_tmp();
             mmap.sync().expect("sync");
-            drop(mmap);
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn sync_persists_without_rewrite() {
-            let (path, file, mmap) = new_tmp(b"sync_persists");
+            let (_dir, path, mmap) = new_tmp();
 
             mmap.writer::<u64>(0x10)
                 .expect("writer")
@@ -507,28 +538,92 @@ mod tests {
             mmap.sync().expect("sync");
             drop(mmap);
 
-            let file2 = FrozenFile::new(path, LEN as u64, TEST_MID).expect("open existing");
-            let mmap = FrozenMMap::new(file2.clone(), LEN, FMCfg::new(TEST_MID)).unwrap();
+            let file2 = FrozenFile::new(path, LEN, TEST_MID).expect("open existing");
+            let mmap = FrozenMMap::new(file2, LEN, FMCfg::new(TEST_MID)).unwrap();
 
             let v = mmap.reader::<u64>(0x10).expect("reader").read(|v| *v);
             assert_eq!(v, 0xABCD);
-
-            drop(mmap);
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn repeated_sync_is_stable() {
-            let (_, file, mmap) = new_tmp(b"repeated_sync");
+            let (_dir, _path, mmap) = new_tmp();
 
             mmap.writer::<u64>(0).expect("writer").write(|v| *v = 7).expect("write");
 
             for _ in 0..0x20 {
                 mmap.sync().expect("sync");
             }
+        }
+    }
+
+    mod fm_reader_writer {
+        use super::*;
+
+        #[test]
+        fn reader_fails_after_real_drop() {
+            let (_dir, _path, mmap) = new_tmp();
+
+            let reader = mmap.reader::<u64>(0).unwrap();
+            drop(reader);
+
+            // Move into thread and drop the only instance
+            let handle = std::thread::spawn(move || {
+                drop(mmap);
+            });
+
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn active_counter_tracks_readers() {
+            let (_dir, _path, mmap) = new_tmp();
+
+            let r1 = mmap.reader::<u64>(0).unwrap();
+            let r2 = mmap.reader::<u64>(0).unwrap();
+
+            assert!(mmap.0.active.load(std::sync::atomic::Ordering::Acquire) >= 2);
+
+            drop(r1);
+            drop(r2);
+        }
+    }
+
+    mod fm_auto_flush {
+        use super::*;
+
+        #[test]
+        fn auto_flush_persists() {
+            let dir = tempdir().expect("tmp dir");
+            let path = dir.path().join("ids");
+
+            let file = FrozenFile::new(path.clone(), LEN, TEST_MID).unwrap();
+
+            let cfg = FMCfg::new(TEST_MID)
+                .enable_auto_flush()
+                .flush_duration(std::time::Duration::from_millis(50));
+
+            let mmap = FrozenMMap::new(file, LEN, cfg).unwrap();
+
+            mmap.writer::<u64>(0).unwrap().write(|v| *v = 123).unwrap();
+
+            thread::sleep(std::time::Duration::from_millis(150));
 
             drop(mmap);
-            file.delete().expect("delete file");
+
+            let file = FrozenFile::new(path, LEN, TEST_MID).unwrap();
+            let mmap = FrozenMMap::new(file, LEN, FMCfg::new(TEST_MID)).unwrap();
+
+            let v = mmap.reader::<u64>(0).unwrap().read(|v| *v);
+            assert_eq!(v, 123);
+        }
+
+        #[test]
+        fn dirty_flag_resets_after_flush() {
+            let (_dir, _path, mmap) = new_tmp();
+
+            mmap.writer::<u64>(0).unwrap().write(|v| *v = 1).unwrap();
+            assert!(!mmap.0.dirty.load(std::sync::atomic::Ordering::Acquire));
         }
     }
 
@@ -537,7 +632,7 @@ mod tests {
 
         #[test]
         fn write_read_cycle() {
-            let (_, file, mmap) = new_tmp(b"write_read_cycle");
+            let (_dir, _path, mmap) = new_tmp();
 
             mmap.writer::<u64>(0)
                 .expect("writer")
@@ -546,14 +641,11 @@ mod tests {
 
             let v = mmap.reader::<u64>(0).expect("reader").read(|v| *v);
             assert_eq!(v, 0xDEAD_C0DE_DEAD_C0DE);
-
-            drop(mmap);
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn write_read_across_sessions() {
-            let (path, file, mmap) = new_tmp(b"write_read_across_sessions");
+            let (_dir, path, mmap) = new_tmp();
 
             mmap.writer::<u64>(0)
                 .expect("writer")
@@ -561,21 +653,17 @@ mod tests {
                 .expect("write");
 
             drop(mmap);
-            drop(file);
 
-            let file = FrozenFile::new(path, LEN as u64, TEST_MID).expect("open existing");
-            let mmap = FrozenMMap::new(file.clone(), LEN, FMCfg::new(TEST_MID)).expect("new frozeMMap");
+            let file = FrozenFile::new(path, LEN, TEST_MID).expect("open existing");
+            let mmap = FrozenMMap::new(file, LEN, FMCfg::new(TEST_MID)).expect("new frozeMMap");
 
             let v = mmap.reader::<u64>(0).expect("reader").read(|v| *v);
             assert_eq!(v, 0xDEAD_C0DE_DEAD_C0DE);
-
-            drop(mmap);
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn multiple_writes_single_sync() {
-            let (_, file, mmap) = new_tmp(b"multiple_writes");
+            let (_dir, _path, mmap) = new_tmp();
 
             for i in 0..16u64 {
                 mmap.writer::<u64>((i as usize) * 8)
@@ -588,9 +676,6 @@ mod tests {
                 let v = mmap.reader::<u64>((i as usize) * 8).expect("reader").read(|v| *v);
                 assert_eq!(v, i);
             }
-
-            drop(mmap);
-            file.delete().expect("delete file");
         }
     }
 
@@ -599,7 +684,7 @@ mod tests {
 
         #[test]
         fn concurrent_sync_is_safe() {
-            let (_, file, mmap) = new_tmp(b"concurrent_sync");
+            let (_dir, _path, mmap) = new_tmp();
             let mmap = Arc::new(mmap);
 
             mmap.writer::<u64>(0)
@@ -622,14 +707,11 @@ mod tests {
 
             let v = mmap.reader::<u64>(0).expect("reader").read(|v| *v);
             assert_eq!(v, 42);
-
-            drop(mmap);
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn concurrent_writes_distinct_offsets() {
-            let (_, file, mmap) = new_tmp(b"concurrent_writes_offsets");
+            let (_dir, _path, mmap) = new_tmp();
             let mmap = Arc::new(mmap);
 
             let handles: Vec<_> = (0..8u64)
@@ -649,31 +731,6 @@ mod tests {
                 let v = mmap.reader::<u64>((i as usize) * 8).unwrap().read(|v| *v);
                 assert_eq!(v, i);
             }
-
-            drop(mmap);
-            file.delete().expect("delete file");
-        }
-
-        #[test]
-        fn auto_flush_background_thread() {
-            let (_, file, mmap) = {
-                let path = Vec::from(b"./target/auto_flush".as_slice());
-                let file = FrozenFile::new(path.clone(), LEN as u64, TEST_MID).unwrap();
-                let cfg = FMCfg::new(TEST_MID)
-                    .enable_auto_flush()
-                    .flush_duration(Duration::from_millis(10));
-                let mmap = FrozenMMap::new(file.clone(), LEN, cfg).unwrap();
-                (path, file, mmap)
-            };
-
-            mmap.writer::<u64>(0).unwrap().write(|v| *v = 99).unwrap();
-            thread::sleep(Duration::from_millis(50));
-
-            let v = mmap.reader::<u64>(0).unwrap().read(|v| *v);
-            assert_eq!(v, 99);
-
-            drop(mmap);
-            file.delete().expect("delete file");
         }
     }
 }

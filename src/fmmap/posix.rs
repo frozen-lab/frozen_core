@@ -169,18 +169,19 @@ unsafe fn err_msg(errno: i32) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::{error::TEST_MID, ffile::FrozenFile};
+    use std::path::PathBuf;
+    use tempfile::{tempdir, TempDir};
 
     const LEN: usize = 0x80;
 
-    fn new_tmp(id: &'static [u8]) -> (Vec<u8>, FrozenFile, POSIXMMap) {
-        let mut path = Vec::with_capacity(b"./target/".len() + id.len());
-        path.extend_from_slice(b"./target/");
-        path.extend_from_slice(id);
+    fn new_tmp() -> (TempDir, PathBuf, FrozenFile, POSIXMMap) {
+        let dir = tempdir().expect("tmp dir");
+        let path = dir.path().join("tmp_file");
 
-        let file = FrozenFile::new(path.clone(), LEN as u64, TEST_MID).expect("new FrozenFile");
+        let file = FrozenFile::new(path.clone(), LEN, TEST_MID).expect("new FrozenFile");
         let mmap = unsafe { POSIXMMap::new(file.fd(), LEN) }.expect("new POSIXMMap");
 
-        (path, file, mmap)
+        (dir, path, file, mmap)
     }
 
     fn perf_sync(_file: &FrozenFile, _mmap: &POSIXMMap, _length: usize) {
@@ -196,11 +197,10 @@ mod tests {
 
         #[test]
         fn map_unmap_works() {
-            let (_, file, map) = new_tmp(b"map_unmap_works");
+            let (_dir, _path, _file, map) = new_tmp();
 
             assert!(!map.ptr.is_null());
             unsafe { map.unmap(LEN) }.expect("unmap");
-            file.delete().expect("delete file");
         }
 
         #[test]
@@ -210,13 +210,32 @@ mod tests {
 
         #[test]
         fn unmap_is_idempotent() {
-            let (_, file, map) = new_tmp(b"unmap_idempotent");
+            let (_dir, _path, _file, map) = new_tmp();
 
             unsafe { map.unmap(LEN) }.expect("unmap");
             unsafe { map.unmap(LEN) }.expect("unmap");
             unsafe { map.unmap(LEN) }.expect("unmap");
+        }
 
-            file.delete().expect("delete file");
+        #[test]
+        fn map_fails_on_zero_length() {
+            let (_dir, _path, file, _) = new_tmp();
+            unsafe { POSIXMMap::new(file.fd(), 0) }.expect_err("zero len must fail");
+        }
+
+        #[test]
+        #[cfg(target_os = "macos")]
+        fn unmap_wrong_length_fails() {
+            let (_dir, _path, _file, map) = new_tmp();
+            unsafe { map.unmap(LEN / 2) }.expect_err("must fail");
+        }
+
+        #[test]
+        fn map_fails_after_file_delete() {
+            let (_dir, _path, file, _map) = new_tmp();
+
+            file.delete().expect("delete");
+            unsafe { POSIXMMap::new(file.fd(), LEN) }.expect_err("must fail");
         }
     }
 
@@ -225,14 +244,13 @@ mod tests {
 
         #[test]
         fn sync_works() {
-            let (_, file, map) = new_tmp(b"sync_works");
+            let (_dir, _path, file, map) = new_tmp();
             perf_sync(&file, &map, LEN);
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn sync_persists_without_rewrite() {
-            let (path, file, map) = new_tmp(b"sync_persists");
+            let (_dir, path, file, map) = new_tmp();
 
             unsafe {
                 *map.get_mut::<u64>(16) = 0xABCD;
@@ -242,19 +260,17 @@ mod tests {
             }
 
             unsafe {
-                let file = FrozenFile::new(path, LEN as u64, TEST_MID).expect("open existing");
+                let file = FrozenFile::new(path, LEN, TEST_MID).expect("open existing");
                 let map = POSIXMMap::new(file.fd(), LEN).expect("new mmap");
 
                 assert_eq!(*map.get::<u64>(16), 0xABCD);
                 map.unmap(LEN).expect("unmap");
             }
-
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn repeated_sync_is_stable() {
-            let (_, file, map) = new_tmp(b"sync_after_sync");
+            let (_dir, _path, file, map) = new_tmp();
 
             unsafe {
                 *map.get_mut::<u64>(0) = 7;
@@ -265,30 +281,49 @@ mod tests {
 
                 map.unmap(LEN).expect("unmap");
             }
-
-            file.delete().expect("delete file");
         }
 
         #[test]
         #[cfg(target_os = "linux")]
         fn sync_after_unmap_should_fail() {
-            let (_, file, map) = new_tmp(b"sync_after_unmap");
+            let (_dir, _path, _file, map) = new_tmp();
 
             unsafe {
                 map.unmap(LEN).expect("unmap");
                 map.sync(LEN).expect_err("must fail");
             }
+        }
 
-            file.delete().expect("delete file");
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn sync_after_multiple_unmaps_fails() {
+            let (_dir, _path, _file, map) = new_tmp();
+
+            unsafe {
+                map.unmap(LEN).expect("unmap");
+                map.unmap(LEN).expect("noop");
+
+                map.sync(LEN).expect_err("must fail");
+            }
+        }
+
+        #[test]
+        fn sync_without_write_is_ok() {
+            let (_dir, _path, file, map) = new_tmp();
+
+            unsafe {
+                perf_sync(&file, &map, LEN);
+                map.unmap(LEN).expect("unmap");
+            }
         }
     }
 
-    mod mmap_write_read {
+    mod posix_write_read {
         use super::*;
 
         #[test]
         fn write_read_cycle() {
-            let (_, file, map) = new_tmp(b"write_read_cycle");
+            let (_dir, _path, file, map) = new_tmp();
 
             unsafe {
                 *map.get_mut::<u64>(0) = 0xDEAD_C0DE_DEAD_C0DE;
@@ -299,13 +334,11 @@ mod tests {
 
                 map.unmap(LEN).expect("unmap");
             }
-
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn write_read_across_sessions() {
-            let (path, file, map) = new_tmp(b"write_read_across_sessions");
+            let (_dir, path, file, map) = new_tmp();
 
             unsafe {
                 *map.get_mut::<u64>(0) = 0xDEAD_C0DE_DEAD_C0DE;
@@ -316,38 +349,33 @@ mod tests {
             drop(file);
 
             unsafe {
-                let file = FrozenFile::new(path.clone(), LEN as u64, TEST_MID).expect("open existing");
+                let file = FrozenFile::new(path.clone(), LEN, TEST_MID).expect("open existing");
                 let map = POSIXMMap::new(file.fd(), LEN).expect("new mmap");
 
                 assert_eq!(*map.get::<u64>(0), 0xDEAD_C0DE_DEAD_C0DE);
                 map.unmap(LEN).expect("unmap");
-
-                file.delete().expect("delete file");
             }
         }
 
         #[test]
         fn mmap_write_is_synced_with_file_read() {
-            let (path, file, map) = new_tmp(b"mmap_write_is_synced_with_file_read");
+            let (_dir, path, file, map) = new_tmp();
 
             unsafe {
                 *map.get_mut::<u64>(0) = 0xDEAD_C0DE_DEAD_C0DE;
                 perf_sync(&file, &map, LEN);
 
-                let p = std::path::Path::new(std::str::from_utf8(&path).expect("utf8 path"));
-                let buf = std::fs::read(p).expect("read file");
+                let buf = std::fs::read(&path).expect("read file");
                 let bytes: [u8; 8] = buf[0..8].try_into().expect("slice len");
                 assert_eq!(u64::from_le_bytes(bytes), 0xDEAD_C0DE_DEAD_C0DE);
 
                 map.unmap(LEN).expect("unmap");
             }
-
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn multiple_writes_single_sync() {
-            let (_, file, map) = new_tmp(b"multiple_writes_single_sync");
+            let (_dir, _path, file, map) = new_tmp();
 
             unsafe {
                 for i in 0..16u64 {
@@ -362,18 +390,29 @@ mod tests {
 
                 map.unmap(LEN).expect("unmap");
             }
+        }
 
-            file.delete().expect("delete file");
+        #[test]
+        fn write_at_boundary() {
+            let (_dir, _path, file, map) = new_tmp();
+
+            unsafe {
+                *map.get_mut::<u8>(LEN - 1) = 0xAA;
+                perf_sync(&file, &map, LEN);
+
+                assert_eq!(*map.get::<u8>(LEN - 1), 0xAA);
+                map.unmap(LEN).expect("unmap");
+            }
         }
     }
 
-    mod mmap_concurrency {
+    mod posix_concurrency {
         use super::*;
         use std::{sync::Arc, thread};
 
         #[test]
         fn munmap_is_thread_safe() {
-            let (_, file, map) = new_tmp(b"munmap_is_thread_safe");
+            let (_dir, _path, _file, map) = new_tmp();
             let map = Arc::new(map);
 
             let handles: Vec<_> = (0..8)
@@ -388,15 +427,13 @@ mod tests {
             for h in handles {
                 h.join().expect("thread join");
             }
-
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn msync_is_thread_safe() {
-            let (_, f, map) = new_tmp(b"msync_is_thread_safe");
+            let (_dir, _path, file, map) = new_tmp();
 
-            let file = Arc::new(f);
+            let file = Arc::new(file);
             let map = Arc::new(map);
 
             unsafe {
@@ -421,13 +458,11 @@ mod tests {
                 assert_eq!(*map.get::<u64>(0), 42);
                 map.unmap(LEN).expect("unmap");
             }
-
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn concurrent_writes_then_sync() {
-            let (_, file, map) = new_tmp(b"concurrent_writes_then_sync");
+            let (_dir, _path, file, map) = new_tmp();
             let map = Arc::new(map);
 
             let handles: Vec<_> = (0..8u64)
@@ -447,13 +482,11 @@ mod tests {
                 perf_sync(&file, &map, LEN);
                 map.unmap(LEN).expect("unmap");
             }
-
-            file.delete().expect("delete file");
         }
 
         #[test]
         fn concurrent_writes_distinct_offsets() {
-            let (_, file, map) = new_tmp(b"concurrent_writes_distinct_offsets");
+            let (_dir, _path, file, map) = new_tmp();
             let map = Arc::new(map);
 
             let handles: Vec<_> = (0..8u64)
@@ -478,8 +511,31 @@ mod tests {
 
                 map.unmap(LEN).expect("unmap");
             }
+        }
 
-            file.delete().expect("delete file");
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn concurrent_sync_and_unmap() {
+            use std::{sync::Arc, thread};
+
+            let (_dir, _path, file, map) = new_tmp();
+            let map = Arc::new(map);
+            let file = Arc::new(file);
+
+            let m1 = map.clone();
+            let f1 = file.clone();
+
+            let t1 = thread::spawn(move || {
+                perf_sync(&f1, &m1, LEN);
+            });
+
+            let m2 = map.clone();
+            let t2 = thread::spawn(move || unsafe {
+                m2.unmap(LEN).ok();
+            });
+
+            t1.join().expect("join");
+            t2.join().expect("join");
         }
     }
 }

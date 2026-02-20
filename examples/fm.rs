@@ -8,10 +8,10 @@ fn main() -> error::FrozenRes<()> {
     let path = dir.join("ff_example.bin");
     std::fs::create_dir_all(&dir).expect("create example dir");
 
-    let ff = ffile::FrozenFile::new(path.as_os_str().as_encoded_bytes().to_vec(), len, module_id)?;
+    let ff = ffile::FrozenFile::new(path, len, module_id)?;
     assert!(ff.fd() >= 0);
 
-    let fm = fmmap::FrozenMMap::new(ff.clone(), len as usize, fmmap::FMCfg::new(module_id)).expect("mmap");
+    let fm = fmmap::FrozenMMap::new(ff, len as usize, fmmap::FMCfg::new(module_id)).expect("mmap");
 
     {
         let w = fm.writer::<u64>(0).expect("writer");

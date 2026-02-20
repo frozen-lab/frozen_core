@@ -84,7 +84,7 @@ pub(in crate::ffile) fn new_err_default<R>(res: FFileErrRes) -> FrozenRes<R> {
 }
 
 /// Custom implementation of `std::fs::File`
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FrozenFile(Arc<Core>);
 
 unsafe impl Send for FrozenFile {}
@@ -363,15 +363,6 @@ mod tests {
             }
 
             assert_eq!(file.length(), total);
-        }
-
-        #[test]
-        fn clone_shares_length() {
-            let (_dir, _path, file) = new_tmp();
-            let clone = file.clone();
-
-            file.grow(64).expect("grow");
-            assert_eq!(clone.length(), 64);
         }
     }
 
