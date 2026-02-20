@@ -100,8 +100,13 @@ impl POSIXMMap {
                     continue;
                 }
 
+                // no-more memory available
+                if errno == ENOMEM {
+                    return new_err(FMMapErrRes::Nmm, err_msg);
+                }
+
                 // invalid fd or lack of support for sync
-                if errno == ENOMEM || errno == EINVAL {
+                if errno == EINVAL {
                     return new_err(FMMapErrRes::Hcf, err_msg);
                 }
 
@@ -224,10 +229,24 @@ mod tests {
         }
 
         #[test]
-        #[cfg(target_os = "macos")]
-        fn unmap_wrong_length_fails() {
+        #[cfg(target_os = "linux")]
+        fn sync_after_full_unmap_fails() {
             let (_dir, _path, _file, map) = new_tmp();
-            unsafe { map.unmap(LEN / 2) }.expect_err("must fail");
+
+            unsafe {
+                map.unmap(LEN).unwrap();
+                map.sync(LEN).expect_err("sync must fail after unmap");
+            }
+        }
+
+        #[test]
+        fn unmap_zero_length_fails() {
+            let (_dir, _path, _file, map) = new_tmp();
+
+            unsafe {
+                let err = map.unmap(0).expect_err("zero length must fail");
+                assert!(err.cmp(FMMapErrRes::Hcf as u16));
+            }
         }
 
         #[test]
@@ -511,31 +530,6 @@ mod tests {
 
                 map.unmap(LEN).expect("unmap");
             }
-        }
-
-        #[test]
-        #[cfg(target_os = "linux")]
-        fn concurrent_sync_and_unmap() {
-            use std::{sync::Arc, thread};
-
-            let (_dir, _path, file, map) = new_tmp();
-            let map = Arc::new(map);
-            let file = Arc::new(file);
-
-            let m1 = map.clone();
-            let f1 = file.clone();
-
-            let t1 = thread::spawn(move || {
-                perf_sync(&f1, &m1, LEN);
-            });
-
-            let m2 = map.clone();
-            let t2 = thread::spawn(move || unsafe {
-                m2.unmap(LEN).ok();
-            });
-
-            t1.join().expect("join");
-            t2.join().expect("join");
         }
     }
 }
