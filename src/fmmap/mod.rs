@@ -162,7 +162,7 @@ impl FrozenMMap {
     /// Returns the [`FrozenErr`] representing the last error occurred in [`FrozenMMap`]
     #[inline]
     pub fn last_error(&self) -> Option<&FrozenErr> {
-        self.0.error.get()
+        self.0.get_sync_error()
     }
 
     /// Get's a read only typed pointer for `T`
@@ -335,6 +335,14 @@ impl Drop for FrozenMMap {
             }
         }
 
+        // free up the boxed error (if any)
+        let ptr = self.0.error.load(atomic::Ordering::Acquire);
+        if !ptr.is_null() {
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
+        }
+
         let _ = self.munmap();
     }
 }
@@ -361,7 +369,7 @@ struct Core {
     shutdown_cv: sync::Condvar,
     growing: atomic::AtomicBool,
     active: atomic::AtomicUsize,
-    error: sync::OnceLock<FrozenErr>,
+    error: atomic::AtomicPtr<FrozenErr>,
     mmap: cell::UnsafeCell<mem::ManuallyDrop<TMap>>,
 }
 
@@ -375,11 +383,11 @@ impl Core {
             ffile,
             cv: sync::Condvar::new(),
             lock: sync::Mutex::new(()),
-            error: sync::OnceLock::new(),
             shutdown_cv: sync::Condvar::new(),
             active: atomic::AtomicUsize::new(0),
             dirty: atomic::AtomicBool::new(false),
             growing: atomic::AtomicBool::new(false),
+            error: atomic::AtomicPtr::new(std::ptr::null_mut()),
             mmap: cell::UnsafeCell::new(mem::ManuallyDrop::new(mmap)),
         }
     }
@@ -394,6 +402,40 @@ impl Core {
 
         #[cfg(target_os = "macos")]
         return self.ffile.sync();
+    }
+
+    #[inline]
+    fn set_sync_error(&self, err: FrozenErr) {
+        let boxed = Box::into_raw(Box::new(err));
+        let old = self.error.swap(boxed, atomic::Ordering::AcqRel);
+
+        // NOTE: we must free the old error if any to avoid leaks
+        if !old.is_null() {
+            unsafe {
+                drop(Box::from_raw(old));
+            }
+        }
+    }
+
+    #[inline]
+    fn get_sync_error(&self) -> Option<&FrozenErr> {
+        let ptr = self.error.load(atomic::Ordering::Acquire);
+
+        if hints::likely(ptr.is_null()) {
+            return None;
+        }
+
+        Some(unsafe { &*ptr })
+    }
+
+    #[inline]
+    fn clear_sync_error(&self) {
+        let old = self.error.swap(std::ptr::null_mut(), atomic::Ordering::AcqRel);
+        if hints::unlikely(!old.is_null()) {
+            unsafe {
+                drop(Box::from_raw(old));
+            }
+        }
     }
 
     fn spawn_tx(core: sync::Arc<Self>) -> FrozenRes<()> {
@@ -435,7 +477,7 @@ impl Core {
                     err_msg.extend_from_slice(b"Flush thread died before init could be completed for FrozenMMap");
 
                     let err = FrozenErr::new(mid(), ERRDOMAIN, res as u16, detail, err_msg);
-                    let _ = core.error.set(err);
+                    core.set_sync_error(err);
                 }
                 return;
             }
@@ -453,7 +495,7 @@ impl Core {
                     let detail = res.default_message();
 
                     let err = FrozenErr::new(mid(), ERRDOMAIN, res as u16, detail, e.to_string().as_bytes().to_vec());
-                    let _ = core.error.set(err);
+                    core.set_sync_error(err);
                     return;
                 }
             };
@@ -468,7 +510,7 @@ impl Core {
 
                         let err =
                             FrozenErr::new(mid(), ERRDOMAIN, res as u16, detail, e.to_string().as_bytes().to_vec());
-                        let _ = core.error.set(err);
+                        core.set_sync_error(err);
                         return;
                     }
                 };
@@ -477,9 +519,16 @@ impl Core {
             if core.dirty.swap(false, atomic::Ordering::AcqRel) {
                 drop(guard);
 
-                if let Err(error) = core.sync() {
-                    let _ = core.error.set(error);
-                    return;
+                // NOTE: if sync fails, we update the Core::error w/ the gathered error object,
+                // and we clear it up when another sync call succeeds
+                //
+                // This is valid cause, the underlying sync, flushes entire mmaped region, so
+                // even if the last call failed, and the new one succeeds, we do get the durability
+                // guarenty for the old data as well
+
+                match core.sync() {
+                    Ok(_) => core.clear_sync_error(),
+                    Err(err) => core.set_sync_error(err),
                 }
 
                 guard = match core.lock.lock() {
@@ -490,7 +539,7 @@ impl Core {
 
                         let err =
                             FrozenErr::new(mid(), ERRDOMAIN, res as u16, detail, e.to_string().as_bytes().to_vec());
-                        let _ = core.error.set(err);
+                        core.set_sync_error(err);
                         return;
                     }
                 };

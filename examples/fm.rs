@@ -17,5 +17,5 @@ fn main() {
     fm.sync().expect("sync");
 
     let value = fm.with_read::<u64, u64>(0, |v| *v).unwrap();
-    assert_eq!(value, 0xDEADBEEF);
+    assert_eq!(value, 0xDEADC0DE);
 }
