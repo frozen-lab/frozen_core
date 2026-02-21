@@ -1,6 +1,6 @@
-use frozen_core::{error, ffile, fmmap};
+use frozen_core::{ffile, fmmap};
 
-fn main() -> error::FrozenRes<()> {
+fn main() {
     let module_id = 0u8;
     let len = 0x10;
 
@@ -8,21 +8,14 @@ fn main() -> error::FrozenRes<()> {
     let path = dir.join("ff_example.bin");
     std::fs::create_dir_all(&dir).expect("create example dir");
 
-    let ff = ffile::FrozenFile::new(path, len, module_id)?;
+    let ff = ffile::FrozenFile::new(path, len, module_id).expect("new FFile");
     assert!(ff.fd() >= 0);
 
     let fm = fmmap::FrozenMMap::new(ff, len as usize, fmmap::FMCfg::new(module_id)).expect("mmap");
 
-    {
-        let w = fm.writer::<u64>(0).expect("writer");
-        w.write(|v| *v = 0xDEADBEEF).expect("write");
-    }
-
+    fm.with_write::<u64, _>(0, |v| *v = 0xDEADC0DE);
     fm.sync().expect("sync");
 
-    let r = fm.reader::<u64>(0).expect("reader");
-    let value = r.read(|v| *v);
-
+    let value = fm.with_read::<u64, u64>(0, |v| *v);
     assert_eq!(value, 0xDEADBEEF);
-    Ok(())
 }

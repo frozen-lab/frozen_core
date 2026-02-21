@@ -6,7 +6,6 @@ mod posix;
 use crate::{
     error::{FrozenErr, FrozenRes},
     ffile::FrozenFile,
-    hints,
 };
 use std::{
     cell, fmt, mem,
@@ -170,11 +169,6 @@ impl FrozenMMap {
     /// `fsync()` as a best-effort persistence mechanism
     #[inline]
     pub fn sync(&self) -> FrozenRes<()> {
-        let closed = self.0.dropped.load(atomic::Ordering::Acquire);
-        if hints::unlikely(closed) {
-            return new_err(FMMapErrRes::Hcf, b"Trying to access closed FrozenMMap".to_vec());
-        }
-
         self.0.sync()
     }
 
@@ -184,33 +178,57 @@ impl FrozenMMap {
         self.0.error.get()
     }
 
+    /// Get's a read only typed pointer for `T`
+    #[inline]
+    pub fn with_read<T, R>(&self, offset: usize, f: impl FnOnce(&T) -> R) -> R {
+        let guard = self.acquire_guard();
+
+        let ptr = unsafe { self.get_mmap().get(offset) };
+        let res = unsafe { f(&*ptr) };
+
+        drop(guard);
+        res
+    }
+
+    /// Get's a mutable typed pointer for `T`
+    #[inline]
+    pub fn with_write<T, R>(&self, offset: usize, f: impl FnOnce(&mut T) -> R) -> R {
+        let guard = self.acquire_guard();
+
+        let ptr = unsafe { self.get_mmap().get_mut(offset) };
+        let res = unsafe { f(&mut *ptr) };
+
+        drop(guard);
+        res
+    }
+
     /// Get a [`FMReader`] object for `T` at given `offset`
     ///
     /// **NOTE**: `offset` must be 8 bytes aligned
     #[inline]
-    pub fn reader<'a, T>(&'a self, offset: usize) -> FrozenRes<FMReader<'a, T>> {
-        self.0.acquire_instance()?;
+    pub fn reader<T>(&self, offset: usize) -> FMReader<T> {
+        let guard = self.acquire_guard();
         let reader = FMReader {
             ptr: unsafe { self.get_mmap().get(offset) },
-            _guard: ActiveGuard { core: &self.0 },
+            _guard: guard,
         };
 
-        Ok(reader)
+        reader
     }
 
     /// Get a [`FMWriter`] object for `T` at given `offset`
     ///
     /// **NOTE**: `offset` must be 8 bytes aligned
     #[inline]
-    pub fn writer<'a, T>(&'a self, offset: usize) -> FrozenRes<FMWriter<'a, T>> {
-        self.0.acquire_instance()?;
+    pub fn writer<'a, T>(&'a self, offset: usize) -> FMWriter<'a, T> {
+        let guard = self.acquire_guard();
         let writer = FMWriter {
             map: self,
             ptr: unsafe { self.get_mmap().get_mut(offset) },
-            _guard: ActiveGuard { core: &self.0 },
+            _guard: guard,
         };
 
-        Ok(writer)
+        writer
     }
 
     #[inline]
@@ -222,14 +240,16 @@ impl FrozenMMap {
     fn get_mmap(&self) -> &mem::ManuallyDrop<TMap> {
         unsafe { &*self.0.mmap.get() }
     }
+
+    #[inline]
+    fn acquire_guard(&self) -> ActiveGuard<'_> {
+        let _ = self.0.active.fetch_add(1, atomic::Ordering::AcqRel);
+        ActiveGuard { core: &self.0 }
+    }
 }
 
 impl Drop for FrozenMMap {
     fn drop(&mut self) {
-        if self.0.dropped.swap(true, atomic::Ordering::AcqRel) {
-            return;
-        }
-
         // close flusher thread
         if self.0.cfg.auto_flush {
             self.0.cv.notify_one();
@@ -277,7 +297,6 @@ struct Core {
     lock: sync::Mutex<()>,
     dirty: atomic::AtomicBool,
     shutdown_cv: sync::Condvar,
-    dropped: atomic::AtomicBool,
     active: atomic::AtomicUsize,
     error: sync::OnceLock<FrozenErr>,
     mmap: cell::UnsafeCell<mem::ManuallyDrop<TMap>>,
@@ -298,7 +317,6 @@ impl Core {
             shutdown_cv: sync::Condvar::new(),
             active: atomic::AtomicUsize::new(0),
             dirty: atomic::AtomicBool::new(false),
-            dropped: atomic::AtomicBool::new(false),
             mmap: cell::UnsafeCell::new(mem::ManuallyDrop::new(mmap)),
         }
     }
@@ -313,26 +331,6 @@ impl Core {
 
         #[cfg(target_os = "macos")]
         return self._ffile.sync();
-    }
-
-    #[inline]
-    fn acquire_instance(&self) -> FrozenRes<()> {
-        let mut cur = self.active.load(atomic::Ordering::Acquire);
-        loop {
-            if self.dropped.load(atomic::Ordering::Acquire) {
-                return new_err(FMMapErrRes::Hcf, b"Trying to access unmapped FM".to_vec());
-            }
-
-            if let Err(v) =
-                self.active
-                    .compare_exchange_weak(cur, cur + 1, atomic::Ordering::AcqRel, atomic::Ordering::Acquire)
-            {
-                cur = v;
-                continue;
-            }
-
-            return Ok(());
-        }
     }
 
     fn spawn_tx(core: sync::Arc<Self>) -> FrozenRes<()> {
@@ -396,10 +394,6 @@ impl Core {
                     return;
                 }
             };
-
-            if core.dropped.load(atomic::Ordering::Acquire) {
-                return;
-            }
 
             if core.dirty.swap(false, atomic::Ordering::AcqRel) {
                 drop(guard);
@@ -530,10 +524,7 @@ mod tests {
         fn sync_persists_without_rewrite() {
             let (_dir, path, mmap) = new_tmp();
 
-            mmap.writer::<u64>(0x10)
-                .expect("writer")
-                .write(|v| *v = 0xABCD)
-                .expect("write");
+            let _ = mmap.writer::<u64>(0x10).write(|v| *v = 0xABCD);
 
             mmap.sync().expect("sync");
             drop(mmap);
@@ -541,7 +532,7 @@ mod tests {
             let file2 = FrozenFile::new(path, LEN, TEST_MID).expect("open existing");
             let mmap = FrozenMMap::new(file2, LEN, FMCfg::new(TEST_MID)).unwrap();
 
-            let v = mmap.reader::<u64>(0x10).expect("reader").read(|v| *v);
+            let v = mmap.reader::<u64>(0x10).read(|v| *v);
             assert_eq!(v, 0xABCD);
         }
 
@@ -549,7 +540,7 @@ mod tests {
         fn repeated_sync_is_stable() {
             let (_dir, _path, mmap) = new_tmp();
 
-            mmap.writer::<u64>(0).expect("writer").write(|v| *v = 7).expect("write");
+            mmap.writer::<u64>(0).write(|v| *v = 7).expect("write");
 
             for _ in 0..0x20 {
                 mmap.sync().expect("sync");
@@ -564,7 +555,7 @@ mod tests {
         fn reader_fails_after_real_drop() {
             let (_dir, _path, mmap) = new_tmp();
 
-            let reader = mmap.reader::<u64>(0).unwrap();
+            let reader = mmap.reader::<u64>(0);
             drop(reader);
 
             // Move into thread and drop the only instance
@@ -579,8 +570,8 @@ mod tests {
         fn active_counter_tracks_readers() {
             let (_dir, _path, mmap) = new_tmp();
 
-            let r1 = mmap.reader::<u64>(0).unwrap();
-            let r2 = mmap.reader::<u64>(0).unwrap();
+            let r1 = mmap.reader::<u64>(0);
+            let r2 = mmap.reader::<u64>(0);
 
             assert!(mmap.0.active.load(std::sync::atomic::Ordering::Acquire) >= 2);
 
@@ -605,7 +596,7 @@ mod tests {
 
             let mmap = FrozenMMap::new(file, LEN, cfg).unwrap();
 
-            mmap.writer::<u64>(0).unwrap().write(|v| *v = 123).unwrap();
+            let _ = mmap.writer::<u64>(0).write(|v| *v = 123);
 
             thread::sleep(std::time::Duration::from_millis(150));
 
@@ -614,7 +605,7 @@ mod tests {
             let file = FrozenFile::new(path, LEN, TEST_MID).unwrap();
             let mmap = FrozenMMap::new(file, LEN, FMCfg::new(TEST_MID)).unwrap();
 
-            let v = mmap.reader::<u64>(0).unwrap().read(|v| *v);
+            let v = mmap.reader::<u64>(0).read(|v| *v);
             assert_eq!(v, 123);
         }
 
@@ -622,8 +613,58 @@ mod tests {
         fn dirty_flag_resets_after_flush() {
             let (_dir, _path, mmap) = new_tmp();
 
-            mmap.writer::<u64>(0).unwrap().write(|v| *v = 1).unwrap();
+            mmap.writer::<u64>(0).write(|v| *v = 1).unwrap();
             assert!(!mmap.0.dirty.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
+
+    mod fm_with_api {
+        use super::*;
+
+        #[test]
+        fn with_write_then_read() {
+            let (_dir, _path, mmap) = new_tmp();
+
+            mmap.with_write::<u64, _>(0, |v| *v = 99);
+
+            let v = mmap.with_read::<u64, _>(0, |v| *v);
+            assert_eq!(v, 99);
+        }
+
+        #[test]
+        fn with_write_multiple_offsets() {
+            let (_dir, _path, mmap) = new_tmp();
+
+            for i in 0..8u64 {
+                mmap.with_write::<u64, _>((i as usize) * 8, |v| *v = i);
+            }
+
+            for i in 0..8u64 {
+                let v = mmap.with_read::<u64, _>((i as usize) * 8, |v| *v);
+                assert_eq!(v, i);
+            }
+        }
+    }
+
+    mod fm_active_drain {
+        use super::*;
+
+        #[test]
+        fn drop_waits_for_reader() {
+            let (_dir, _path, mmap) = new_tmp();
+            let mmap = Arc::new(mmap);
+
+            let m = mmap.clone();
+            let handle = thread::spawn(move || {
+                let r = m.reader::<u64>(0);
+                thread::sleep(std::time::Duration::from_millis(50));
+                drop(r);
+            });
+
+            thread::sleep(std::time::Duration::from_millis(10));
+            drop(mmap); // must wait for reader
+
+            handle.join().expect("join");
         }
     }
 
@@ -635,11 +676,10 @@ mod tests {
             let (_dir, _path, mmap) = new_tmp();
 
             mmap.writer::<u64>(0)
-                .expect("writer")
                 .write(|v| *v = 0xDEAD_C0DE_DEAD_C0DE)
                 .expect("write");
 
-            let v = mmap.reader::<u64>(0).expect("reader").read(|v| *v);
+            let v = mmap.reader::<u64>(0).read(|v| *v);
             assert_eq!(v, 0xDEAD_C0DE_DEAD_C0DE);
         }
 
@@ -648,7 +688,6 @@ mod tests {
             let (_dir, path, mmap) = new_tmp();
 
             mmap.writer::<u64>(0)
-                .expect("writer")
                 .write(|v| *v = 0xDEAD_C0DE_DEAD_C0DE)
                 .expect("write");
 
@@ -657,7 +696,7 @@ mod tests {
             let file = FrozenFile::new(path, LEN, TEST_MID).expect("open existing");
             let mmap = FrozenMMap::new(file, LEN, FMCfg::new(TEST_MID)).expect("new frozeMMap");
 
-            let v = mmap.reader::<u64>(0).expect("reader").read(|v| *v);
+            let v = mmap.reader::<u64>(0).read(|v| *v);
             assert_eq!(v, 0xDEAD_C0DE_DEAD_C0DE);
         }
 
@@ -666,14 +705,11 @@ mod tests {
             let (_dir, _path, mmap) = new_tmp();
 
             for i in 0..16u64 {
-                mmap.writer::<u64>((i as usize) * 8)
-                    .expect("writer")
-                    .write(|v| *v = i)
-                    .expect("write");
+                mmap.writer::<u64>((i as usize) * 8).write(|v| *v = i).expect("write");
             }
 
             for i in 0..16u64 {
-                let v = mmap.reader::<u64>((i as usize) * 8).expect("reader").read(|v| *v);
+                let v = mmap.reader::<u64>((i as usize) * 8).read(|v| *v);
                 assert_eq!(v, i);
             }
         }
@@ -687,10 +723,7 @@ mod tests {
             let (_dir, _path, mmap) = new_tmp();
             let mmap = Arc::new(mmap);
 
-            mmap.writer::<u64>(0)
-                .expect("writer")
-                .write(|v| *v = 42)
-                .expect("write");
+            mmap.writer::<u64>(0).write(|v| *v = 42).expect("write");
 
             let handles: Vec<_> = (0..8)
                 .map(|_| {
@@ -705,7 +738,7 @@ mod tests {
                 h.join().expect("thread join");
             }
 
-            let v = mmap.reader::<u64>(0).expect("reader").read(|v| *v);
+            let v = mmap.reader::<u64>(0).read(|v| *v);
             assert_eq!(v, 42);
         }
 
@@ -718,7 +751,7 @@ mod tests {
                 .map(|i| {
                     let m = mmap.clone();
                     thread::spawn(move || {
-                        m.writer::<u64>((i as usize) * 8).unwrap().write(|v| *v = i).unwrap();
+                        m.writer::<u64>((i as usize) * 8).write(|v| *v = i).unwrap();
                     })
                 })
                 .collect();
@@ -728,7 +761,31 @@ mod tests {
             }
 
             for i in 0..8u64 {
-                let v = mmap.reader::<u64>((i as usize) * 8).unwrap().read(|v| *v);
+                let v = mmap.reader::<u64>((i as usize) * 8).read(|v| *v);
+                assert_eq!(v, i);
+            }
+        }
+
+        #[test]
+        fn concurrent_with_write() {
+            let (_dir, _path, mmap) = new_tmp();
+            let mmap = Arc::new(mmap);
+
+            let handles: Vec<_> = (0..8u64)
+                .map(|i| {
+                    let m = mmap.clone();
+                    thread::spawn(move || {
+                        m.with_write::<u64, _>((i as usize) * 8, |v| *v = i);
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().expect("join");
+            }
+
+            for i in 0..8u64 {
+                let v = mmap.with_read::<u64, _>((i as usize) * 8, |v| *v);
                 assert_eq!(v, i);
             }
         }

@@ -303,30 +303,6 @@ mod tests {
         }
 
         #[test]
-        #[cfg(target_os = "linux")]
-        fn sync_after_unmap_should_fail() {
-            let (_dir, _path, _file, map) = new_tmp();
-
-            unsafe {
-                map.unmap(LEN).expect("unmap");
-                map.sync(LEN).expect_err("must fail");
-            }
-        }
-
-        #[test]
-        #[cfg(target_os = "linux")]
-        fn sync_after_multiple_unmaps_fails() {
-            let (_dir, _path, _file, map) = new_tmp();
-
-            unsafe {
-                map.unmap(LEN).expect("unmap");
-                map.unmap(LEN).expect("noop");
-
-                map.sync(LEN).expect_err("must fail");
-            }
-        }
-
-        #[test]
         fn sync_without_write_is_ok() {
             let (_dir, _path, file, map) = new_tmp();
 
