@@ -4,20 +4,20 @@ Custom implementations and core utilities for frozen codebases.
 
 ## Index
 
-- [`setup`](#setup)
+- [`usage`](#usage)
 - [`ffile`](#frozenfile)
 - [`fmmap`](#frozenmmap)
 - [`error`](#frozenerr)
 - [`hints`](#hints)
 - [`notes`](#notes)
 
-## Setup
+## Usage
 
 Add following to your `Cargo.toml`,
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.5", default-features = true }
+frozen-core = { version = "0.0.6", default-features = true }
 ```
 
 > [!TIP]
@@ -31,7 +31,7 @@ To use the `ffile` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.5", default-features = false, features = ["ffile"] }
+frozen-core = { version = "0.0.6", default-features = false, features = ["ffile"] }
 ```
 
 `FrozenFile` is currently available on the following platforms,
@@ -55,7 +55,7 @@ To use the `fmmap` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.5", default-features = false, features = ["fmmap"] }
+frozen-core = { version = "0.0.6", default-features = false, features = ["fmmap"] }
 ```
 
 `FrozenMMap` is currently available on the following platforms,
@@ -79,7 +79,7 @@ To use the `error` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.5", default-features = false, features = ["error"] }
+frozen-core = { version = "0.0.6", default-features = false, features = ["error"] }
 ```
 
 ## Hints
@@ -90,7 +90,7 @@ To use the `hints` module, add it as a dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-frozen-core = { version = "0.0.5", default-features = false, features = ["hints"] }
+frozen-core = { version = "0.0.6", default-features = false, features = ["hints"] }
 ```
 
 ## Notes

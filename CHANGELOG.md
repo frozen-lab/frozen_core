@@ -1,5 +1,13 @@
 # Changelog
 
+## `0.0.6`
+
+- `FF` improved public api
+- `FM` module
+  - added `epoch` ids for every writes
+  - added `wait_for_durability` to enable waiting for durability
+- improved test coverage (80+ tests)
+
 ## `0.0.5`
 
 - improved error propogation
